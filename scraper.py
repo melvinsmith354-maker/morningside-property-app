@@ -8,24 +8,14 @@ from bs4 import BeautifulSoup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "properties.db")
 
-PRESET_SEARCHES = [
-    {
-        "name": "Morningside",
-        "url": "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258"
-    }
-]
+MORNINGSIDE_URL = "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # 🧹 DROP OLD TABLES TO CLEAR SCHEMA MISMATCHES
-    c.execute("DROP TABLE IF EXISTS raw_listings")
-    c.execute("DROP TABLE IF EXISTS area_stats")
-
-    # Table for raw scraped listings
     c.execute('''
-        CREATE TABLE raw_listings (
+        CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
             suburb TEXT,
@@ -37,9 +27,8 @@ def init_db():
         )
     ''')
     
-    # Table for area statistics (exact 7 columns)
     c.execute('''
-        CREATE TABLE area_stats (
+        CREATE TABLE IF NOT EXISTS area_stats (
             suburb TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
@@ -58,12 +47,10 @@ def clean_area_data(rates):
 
     rates = sorted(rates)
     
-    # Pass 1: Physical Reality Filter
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
 
-    # Pass 2: Isolation Gap Detection
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -132,12 +119,12 @@ def run_scraper():
     }
 
     suburb_name = "Morningside"
-    base_url = PRESET_SEARCHES[0]["url"].rstrip('/')
+    base_url = MORNINGSIDE_URL.rstrip('/')
     
     print(f"\n--- Scraping Morningside ---")
 
     page = 1
-    max_pages = 10
+    max_pages = 5  # Set to 5 pages for fast & reliable scraping
     listings = []
 
     while page <= max_pages:
@@ -147,6 +134,7 @@ def run_scraper():
         try:
             res = requests.get(page_url, headers=headers, timeout=10)
             if res.status_code != 200:
+                print(f"Page {page} returned status {res.status_code}")
                 break
 
             soup = BeautifulSoup(res.text, "html.parser")
