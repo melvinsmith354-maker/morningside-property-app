@@ -8,33 +8,15 @@ from bs4 import BeautifulSoup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "properties.db")
 
-PRESET_SEARCHES = [
-    {"name": "Morningside", "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"},
-    {"name": "Bryanston", "url": "https://www.property24.com/apartments-for-sale/bryanston/sandton/gauteng/5176"},
-    {"name": "Sandhurst", "url": "https://www.property24.com/apartments-for-sale/sandhurst/sandton/gauteng/5847"},
-    {"name": "Sandton Central", "url": "https://www.property24.com/apartments-for-sale/sandton-central/sandton/gauteng/16732"},
-    {"name": "Hyde Park", "url": "https://www.property24.com/apartments-for-sale/hyde-park/sandton/gauteng/5832"},
-    {"name": "Hurlingham", "url": "https://www.property24.com/apartments-for-sale/hurlingham/sandton/gauteng/5860"},
-    {"name": "Sandown", "url": "https://www.property24.com/apartments-for-sale/sandown/sandton/gauteng/5178"},
-    {"name": "Benmore Gardens", "url": "https://www.property24.com/apartments-for-sale/benmore-gardens/sandton/gauteng/11001"},
-    {"name": "Edenburg", "url": "https://www.property24.com/apartments-for-sale/edenburg/sandton/gauteng/4253"},
-    {"name": "Houghton Estate", "url": "https://www.property24.com/apartments-for-sale/houghton-estate/johannesburg/gauteng/5926"},
-    {"name": "Linden", "url": "https://www.property24.com/apartments-for-sale/linden/randburg/gauteng/5779"},
-    {"name": "Illovo", "url": "https://www.property24.com/apartments-for-sale/illovo/sandton/gauteng/5833"},
-    {"name": "Melrose", "url": "https://www.property24.com/apartments-for-sale/melrose/johannesburg/gauteng/5837"},
-    {"name": "Woodmead", "url": "https://www.property24.com/apartments-for-sale/woodmead/sandton/gauteng/4288"},
-    {"name": "Sunninghill", "url": "https://www.property24.com/apartments-for-sale/sunninghill/sandton/gauteng/4289"},
-    {"name": "Waterfall", "url": "https://www.property24.com/apartments-for-sale/waterfall/midrand/gauteng/1535"}
-]
+MORNINGSIDE_URL = "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("DROP TABLE IF EXISTS raw_listings")
-    c.execute("DROP TABLE IF EXISTS area_stats")
-
+    
+    # Raw listing records
     c.execute('''
-        CREATE TABLE raw_listings (
+        CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
             suburb TEXT,
@@ -46,8 +28,9 @@ def init_db():
         )
     ''')
     
+    # Suburb summary metrics
     c.execute('''
-        CREATE TABLE area_stats (
+        CREATE TABLE IF NOT EXISTS area_stats (
             suburb TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
@@ -55,6 +38,13 @@ def init_db():
             real_max REAL,
             median_rate REAL,
             top_2_percentile REAL
+        )
+    ''')
+
+    # Prevents duplicate Telegram messages on subsequent re-runs
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sent_alerts (
+            listing_id TEXT PRIMARY KEY
         )
     ''')
     conn.commit()
@@ -97,7 +87,26 @@ def clean_area_data(rates):
 
     return clean_rates, real_min, real_max, median_rate, top_2_thresh
 
-def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
+def is_alert_already_sent(listing_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM sent_alerts WHERE listing_id=?", (str(listing_id),))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_alert_as_sent(listing_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO sent_alerts (listing_id) VALUES (?)", (str(listing_id),))
+    conn.commit()
+    conn.close()
+
+def send_telegram_alert(listing_id, title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
+    if is_alert_already_sent(listing_id):
+        print(f"⏩ Alert already sent for ID {listing_id} ({title}). Skipping duplicate.")
+        return
+
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -106,9 +115,8 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
         return
 
     message = (
-        f"🔥 *TOP 2% APARTMENT BARGAIN ALERT!*\n\n"
+        f"🔥 *TOP 2% MORNINGSIDE BARGAIN ALERT!*\n\n"
         f"📍 *Title:* {title}\n"
-        f"🏷️ *Suburb:* {suburb}\n"
         f"🏆 *Value Rank:* **Top {true_percentile:.1f}%** (#{rank_num} of {total_clean})\n"
         f"📉 *Discount:* **{pct_below_median:.1f}% below median**\n"
         f"💰 *Price:* R {price:,.0f}\n"
@@ -127,7 +135,8 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
     try:
         res = requests.post(api_url, json=payload, timeout=10)
         res.raise_for_status()
-        print(f"✅ Alert sent for: {title} in {suburb}")
+        mark_alert_as_sent(listing_id)
+        print(f"✅ Telegram alert sent & recorded for ID {listing_id}: {title}")
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
@@ -140,121 +149,122 @@ def run_scraper():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    for search in PRESET_SEARCHES:
-        suburb_name = search["name"]
-        base_url = search["url"].rstrip('/')
+    suburb_name = "Morningside"
+    base_url = MORNINGSIDE_URL.rstrip('/')
+    
+    print(f"\n--- Scraping All Pages for Morningside Apartments ---")
+
+    page = 1
+    listings = []
+
+    while True:
+        page_url = base_url if page == 1 else f"{base_url}/p{page}"
+        print(f"Scraping Page {page}...")
         
-        print(f"\n--- Scraping All Apartment Listings: {suburb_name} ---")
-
-        page = 1
-        listings = []
-
-        while True:
-            page_url = base_url if page == 1 else f"{base_url}/p{page}"
-            
-            try:
-                res = requests.get(page_url, headers=headers, timeout=10)
-                if res.status_code != 200:
-                    break
-
-                soup = BeautifulSoup(res.text, "html.parser")
-                tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
-                
-                if not tiles:
-                    break
-
-                for tile in tiles:
-                    link_tag = tile.find("a", href=True)
-                    if not link_tag:
-                        continue
-                    href = link_tag['href']
-                    full_url = href if href.startswith("http") else f"https://www.property24.com{href}"
-                    
-                    listing_id_match = re.search(r'/(\d+)$', href)
-                    listing_id = listing_id_match.group(1) if listing_id_match else href
-
-                    title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
-                    title = title_tag.text.strip() if title_tag else "Apartment Listing"
-
-                    price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
-                    if not price_tag:
-                        continue
-                    price_digits = re.sub(r'[^\d]', '', price_tag.text)
-                    if not price_digits:
-                        continue
-                    price = float(price_digits)
-
-                    sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
-                    if not sqm_tag:
-                        sqm_match = re.search(r'(\d+)\s*m²', tile.text)
-                        sqm = float(sqm_match.group(1)) if sqm_match else None
-                    else:
-                        sqm_digits = re.sub(r'[^\d]', '', sqm_tag.text)
-                        sqm = float(sqm_digits) if sqm_digits else None
-
-                    if not sqm or sqm <= 0:
-                        continue
-
-                    rate_sqm = price / sqm
-
-                    listings.append({
-                        "id": listing_id,
-                        "area": "Gauteng",
-                        "suburb": suburb_name,
-                        "title": title,
-                        "price": price,
-                        "sqm": sqm,
-                        "rate_sqm": rate_sqm,
-                        "url": full_url
-                    })
-
-                page += 1
-
-            except Exception as e:
-                print(f"Error scraping {suburb_name} page {page}: {e}")
+        try:
+            res = requests.get(page_url, headers=headers, timeout=10)
+            if res.status_code != 200:
+                print(f"Reached end of pages on page {page}.")
                 break
 
-        if not listings:
-            continue
+            soup = BeautifulSoup(res.text, "html.parser")
+            tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
+            
+            if not tiles:
+                print(f"No more listings found on page {page}. Scraping complete.")
+                break
 
-        raw_count = len(listings)
+            for tile in tiles:
+                link_tag = tile.find("a", href=True)
+                if not link_tag:
+                    continue
+                href = link_tag['href']
+                full_url = href if href.startswith("http") else f"https://www.property24.com{href}"
+                
+                listing_id_match = re.search(r'/(\d+)$', href)
+                listing_id = listing_id_match.group(1) if listing_id_match else href
 
-        for item in listings:
-            c.execute(
-                "INSERT OR REPLACE INTO raw_listings (id, area, suburb, title, price, sqm, rate_sqm, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (item["id"], item["area"], item["suburb"], item["title"], item["price"], item["sqm"], item["rate_sqm"], item["url"])
-            )
-        conn.commit()
+                title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
+                title = title_tag.text.strip() if title_tag else "Apartment Listing"
 
-        rates = [x["rate_sqm"] for x in listings]
-        clean_rates, real_min, real_max, median_rate, top_2_thresh = clean_area_data(rates)
+                price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
+                if not price_tag:
+                    continue
+                price_digits = re.sub(r'[^\d]', '', price_tag.text)
+                if not price_digits:
+                    continue
+                price = float(price_digits)
 
-        valid_items = [x for x in listings if real_min <= x["rate_sqm"] <= real_max]
-        valid_items.sort(key=lambda x: x["rate_sqm"])
-        total_clean = len(valid_items)
+                sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
+                if not sqm_tag:
+                    sqm_match = re.search(r'(\d+)\s*m²', tile.text)
+                    sqm = float(sqm_match.group(1)) if sqm_match else None
+                else:
+                    sqm_digits = re.sub(r'[^\d]', '', sqm_tag.text)
+                    sqm = float(sqm_digits) if sqm_digits else None
 
-        if total_clean < 1:
-            continue
+                if not sqm or sqm <= 0:
+                    continue
 
+                rate_sqm = price / sqm
+
+                listings.append({
+                    "id": str(listing_id),
+                    "area": "Sandton",
+                    "suburb": suburb_name,
+                    "title": title,
+                    "price": price,
+                    "sqm": sqm,
+                    "rate_sqm": rate_sqm,
+                    "url": full_url
+                })
+
+            page += 1
+
+        except Exception as e:
+            print(f"Error scraping page {page}: {e}")
+            break
+
+    if not listings:
+        print("No listings found!")
+        conn.close()
+        return
+
+    raw_count = len(listings)
+    print(f"Scraped {raw_count} total listings.")
+
+    for item in listings:
         c.execute(
-            "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (suburb_name, raw_count, total_clean, real_min, real_max, median_rate, top_2_thresh)
+            "INSERT OR REPLACE INTO raw_listings (id, area, suburb, title, price, sqm, rate_sqm, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (item["id"], item["area"], item["suburb"], item["title"], item["price"], item["sqm"], item["rate_sqm"], item["url"])
         )
-        conn.commit()
+    conn.commit()
 
-        # Exact Top 2% Slice Count
-        top_2_count = int(np.ceil(total_clean * 0.02))
+    rates = [x["rate_sqm"] for x in listings]
+    clean_rates, real_min, real_max, median_rate, top_2_thresh = clean_area_data(rates)
 
-        # Telegram Alerts for Top 2%
-        for idx, item in enumerate(valid_items[:top_2_count]):
-            rank_num = idx + 1
-            true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
-            pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
+    valid_items = [x for x in listings if real_min <= x["rate_sqm"] <= real_max]
+    valid_items.sort(key=lambda x: x["rate_sqm"])
+    total_clean = len(valid_items)
 
-            send_telegram_alert(
-                item["title"], suburb_name, item["price"], item["sqm"], 
-                item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
-            )
+    c.execute(
+        "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (suburb_name, raw_count, total_clean, real_min, real_max, median_rate, top_2_thresh)
+    )
+    conn.commit()
+
+    # Exact Top 2% slice count (e.g., 2% of 497 = 10 properties)
+    top_2_count = int(np.ceil(total_clean * 0.02))
+
+    for idx, item in enumerate(valid_items[:top_2_count]):
+        rank_num = idx + 1
+        true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
+        pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
+
+        send_telegram_alert(
+            item["id"], item["title"], suburb_name, item["price"], item["sqm"], 
+            item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
+        )
 
     conn.close()
 
