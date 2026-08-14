@@ -81,6 +81,6 @@ if not stats_df.empty:
             st.dataframe(clean_df[['rank_num', 'true_percentile', 'title', 'price', 'sqm', 'rate_sqm', 'url']], use_container_width=True)
 
 else:
-    st.info("👋 Welcome! Make sure **`scraper.py`** is updated in GitHub, then click **🚀 Run Scraper & Market Engine** above to run the analysis.")
+    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the multi-suburb analysis.")
 
 conn.close()
