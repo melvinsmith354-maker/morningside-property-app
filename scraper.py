@@ -1,93 +1,156 @@
-import requests
-from bs4 import BeautifulSoup
+import os
 import re
 import sqlite3
-import os
+import requests
+from bs4 import BeautifulSoup
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+# --- DATABASE SETUP ---
+DB_NAME = "properties.db"
 
-def send_alert(title, price, floor_size, price_sqm, url):
-    msg = (
-        f"🚨 *PROPERTY24 BARGAIN DETECTED!*\n\n"
-        f"🏡 *{title}*\n"
-        f"💰 **Price:** R {price:,.0f}\n"
-        f"📐 **Floor Size:** {floor_size} m²\n"
-        f"📊 **Rate:** *R {price_sqm:,.2f} / m²*\n\n"
-        f"🔗 [View Property24 Listing]({url})"
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # Table for stored user searches
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_searches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_name TEXT,
+            p24_url TEXT,
+            max_price_sqm REAL
+        )
+    ''')
+    # Table for scraped listings
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS listings (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            price REAL,
+            sqm REAL,
+            rate_sqm REAL,
+            url TEXT,
+            notified INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# --- TELEGRAM NOTIFIER ---
+def send_telegram_alert(title, price, sqm, rate_sqm, url):
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    
+    if not token or not chat_id:
+        print("⚠️ Missing Telegram Token or Chat ID environment variables.")
+        return
+
+    message = (
+        f"🔥 *BARGAIN PROPERTY ALERT!*\n\n"
+        f"📍 *Title:* {title}\n"
+        f"💰 *Price:* R {price:,.0f}\n"
+        f"📐 *Size:* {sqm:.0f} m²\n"
+        f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n\n"
+        f"🔗 [View Listing on Property24]({url})"
     )
-    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(api, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
+    }
+    try:
+        res = requests.post(api_url, json=payload)
+        res.raise_for_status()
+        print(f"✅ Alert sent for: {title}")
+    except Exception as e:
+        print(f"❌ Failed to send Telegram alert: {e}")
 
-def parse_num(text):
-    clean = re.sub(r"[^\d]", "", text)
-    return float(clean) if clean else 0.0
-
+# --- SCRAPER ENGINE ---
 def run_scraper():
-    conn = sqlite3.connect("property_app.db")
+    init_db()  # Ensures tables exist before executing queries
+    
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # Get active user searches
-    c.execute("SELECT id, p24_url, max_price_sqm FROM user_searches")
+    c.execute("SELECT id, search_name, p24_url, max_price_sqm FROM user_searches")
     searches = c.fetchall()
     
-    # Default fallback URL if none entered in DB
     if not searches:
-        searches = [(0, "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258", 10000)]
+        print("No user searches found in database.")
+        conn.close()
+        return
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    for search_id, p24_url, target_max_rate in searches:
-        res = requests.get(p24_url, headers=headers)
-        if res.status_code != 200:
-            continue
+    for search_id, search_name, url, max_price_sqm in searches:
+        print(f"Scraping search: {search_name} -> {url}")
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(res.text, "html.parser")
             
-        soup = BeautifulSoup(res.text, "html.parser")
-        listings = soup.find_all("div", class_=re.compile(r"p24_regularTile|js_resultTile"))
-
-        for item in listings:
-            try:
-                link_tag = item.find("a", href=True)
-                if not link_tag: continue
+            # Find Property24 listing cards
+            tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
+            
+            for tile in tiles:
+                # Extract URL & ID
+                link_tag = tile.find("a", href=True)
+                if not link_tag:
+                    continue
+                href = link_tag['href']
+                full_url = href if href.startswith("http") else f"https://www.property24.com{href}"
                 
-                rel_url = link_tag['href']
-                full_url = f"https://www.property24.com{rel_url}" if rel_url.startswith("/") else rel_url
-                
-                prop_id_match = re.search(r"/(\d+)$", full_url)
-                prop_id = prop_id_match.group(1) if prop_id_match else full_url
+                listing_id_match = re.search(r'/(\d+)$', href)
+                listing_id = listing_id_match.group(1) if listing_id_match else href
 
-                # Check if listing was already alerted
-                c.execute("SELECT id FROM properties WHERE id = ?", (prop_id,))
-                if c.fetchone(): continue
+                # Extract Title
+                title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
+                title = title_tag.text.strip() if title_tag else "Property Listing"
 
-                price_tag = item.find("span", class_=re.compile(r"p24_price"))
-                sqm_tag = item.find("span", class_=re.compile(r"p24_size"))
-                title_tag = item.find("span", class_=re.compile(r"p24_title"))
+                # Extract Price
+                price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
+                if not price_tag:
+                    continue
+                price_digits = re.sub(r'[^\d]', '', price_tag.text)
+                if not price_digits:
+                    continue
+                price = float(price_digits)
 
-                if not price_tag or not sqm_tag: continue
+                # Extract Size (m²)
+                sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
+                if not sqm_tag:
+                    # Search text for m² numbers
+                    sqm_match = re.search(r'(\d+)\s*m²', tile.text)
+                    sqm = float(sqm_match.group(1)) if sqm_match else None
+                else:
+                    sqm_digits = re.sub(r'[^\d]', '', sqm_tag.text)
+                    sqm = float(sqm_digits) if sqm_digits else None
 
-                price = parse_num(price_tag.text)
-                floor_size = parse_num(sqm_tag.text)
-                title = title_tag.text.strip() if title_tag else "Morningside Property"
+                if not sqm or sqm <= 0:
+                    continue  # Skip listings without valid size
 
-                if price > 0 and floor_size > 0:
-                    price_sqm = price / floor_size
+                rate_sqm = price / sqm
 
-                    # Save to DB
+                # Save to database
+                c.execute("SELECT notified FROM listings WHERE id = ?", (listing_id,))
+                row = c.fetchone()
+
+                if row is None:
+                    # New listing found
+                    should_notify = 1 if rate_sqm <= max_price_sqm else 0
                     c.execute(
-                        "INSERT OR REPLACE INTO properties (id, title, price, floor_size, price_per_sqm, url) VALUES (?, ?, ?, ?, ?, ?)",
-                        (prop_id, title, price, floor_size, price_sqm, full_url)
+                        "INSERT INTO listings (id, title, price, sqm, rate_sqm, url, notified) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (listing_id, title, price, sqm, rate_sqm, full_url, should_notify)
                     )
                     conn.commit()
+                    
+                    if should_notify:
+                        send_telegram_alert(title, price, sqm, rate_sqm, full_url)
 
-                    # Trigger alert if rate meets target limit
-                    if price_sqm <= target_max_rate:
-                        send_alert(title, price, floor_size, price_sqm, full_url)
-
-            except Exception as e:
-                continue
+        except Exception as e:
+            print(f"Error scraping {url}: {e}")
 
     conn.close()
 
