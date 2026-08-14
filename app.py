@@ -16,6 +16,7 @@ st.caption("Density Outlier Engine & Top 2% Value Tracker")
 
 conn = sqlite3.connect(DB_NAME)
 
+# Action button
 if st.button("🚀 Run Scraper & Market Engine", type="primary"):
     with st.spinner("Scraping Morningside and processing market metrics..."):
         run_scraper()
@@ -24,10 +25,20 @@ if st.button("🚀 Run Scraper & Market Engine", type="primary"):
 
 st.divider()
 
+# Check DB contents
 try:
     stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE suburb='Morningside'", conn)
 except Exception:
     stats_df = pd.DataFrame()
+
+# AUTO-SCRAPE: If database is completely empty on initial page load, trigger initial fetch
+if stats_df.empty:
+    with st.spinner("⚡ Database is empty. Running initial Morningside scrape..."):
+        run_scraper()
+        try:
+            stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE suburb='Morningside'", conn)
+        except Exception:
+            stats_df = pd.DataFrame()
 
 if not stats_df.empty:
     sub_stats = stats_df.iloc[0]
@@ -79,6 +90,6 @@ if not stats_df.empty:
             st.dataframe(display_df, use_container_width=True)
 
 else:
-    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the Morningside analysis.")
+    st.error("⚠️ Unable to load Morningside listings. Click the red button above to retry.")
 
 conn.close()
