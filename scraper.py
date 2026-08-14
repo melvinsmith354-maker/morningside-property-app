@@ -6,19 +6,26 @@ from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
+# 🛠️ EDIT YOUR PRESET SEARCHES & RULES HERE
+PRESET_SEARCHES = [
+    {
+        "name": "Morningside Apartments",
+        "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258",
+        "max_rate": 12000  # Notify if rate <= R12,000/m²
+    },
+    # You can add more areas easily! Just uncomment and edit:
+    # {
+    #     "name": "Sandown Apartments",
+    #     "url": "https://www.property24.com/apartments-for-sale/sandown/sandton/gauteng/4259",
+    #     "max_rate": 11500
+    # }
+]
+
+MIN_JUNK_THRESHOLD = 7500  # Automatically ignore anything under R7,500/m²
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Table for stored user searches
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_searches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            search_name TEXT,
-            p24_url TEXT,
-            max_price_sqm REAL
-        )
-    ''')
-    # Table for scraped listings
     c.execute('''
         CREATE TABLE IF NOT EXISTS listings (
             id TEXT PRIMARY KEY,
@@ -38,7 +45,7 @@ def send_telegram_alert(title, price, sqm, rate_sqm, url):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
     if not token or not chat_id:
-        print("⚠️ Missing Telegram Token or Chat ID environment variables.")
+        print("⚠️ Missing Telegram secrets.")
         return
 
     message = (
@@ -65,31 +72,24 @@ def send_telegram_alert(title, price, sqm, rate_sqm, url):
         print(f"❌ Failed to send Telegram alert: {e}")
 
 def run_scraper():
-    init_db()  # Ensure database tables are ready
-    
+    init_db()
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    
-    c.execute("SELECT id, search_name, p24_url, max_price_sqm FROM user_searches")
-    searches = c.fetchall()
-    
-    if not searches:
-        print("No user searches found in database.")
-        conn.close()
-        return
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
 
-    for search_id, search_name, base_url, max_price_sqm in searches:
-        print(f"\n--- Starting Search: {search_name} ---")
+    for search in PRESET_SEARCHES:
+        search_name = search["name"]
+        base_url = search["url"]
+        max_price_sqm = search["max_rate"]
         
-        # Strip trailing pagination or slashes if user pasted a /p2 link
+        print(f"\n--- Starting Search: {search_name} ---")
         clean_url = re.sub(r'/p\d+/?$', '', base_url.rstrip('/'))
 
         page = 1
-        max_pages = 10  # Scrapes up to 10 pages per search
+        max_pages = 10  # Scrapes up to 10 pages per area
 
         while page <= max_pages:
             page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
@@ -98,14 +98,12 @@ def run_scraper():
             try:
                 res = requests.get(page_url, headers=headers, timeout=10)
                 if res.status_code != 200:
-                    print(f"Page {page} returned status {res.status_code}. Stopping pagination.")
                     break
 
                 soup = BeautifulSoup(res.text, "html.parser")
                 tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
                 
                 if not tiles:
-                    print(f"No properties found on page {page}. Reached end of search results.")
                     break
 
                 for tile in tiles:
@@ -138,21 +136,18 @@ def run_scraper():
                         sqm = float(sqm_digits) if sqm_digits else None
 
                     if not sqm or sqm <= 0:
-                        continue  # Skip entries with missing or zero floor area
+                        continue
 
                     rate_sqm = price / sqm
 
-                    # 🛑 FILTER: Ignore junk data, parking bays, storage units, or faulty sizes (< R7,500/m²)
-                    if rate_sqm < 7500:
-                        print(f"Skipping junk entry/anomaly: '{title}' at R{rate_sqm:,.2f}/m²")
+                    # 🛑 FILTER: Ignore junk entries (< R7,500/m²)
+                    if rate_sqm < MIN_JUNK_THRESHOLD:
                         continue
 
-                    # Database check
                     c.execute("SELECT id FROM listings WHERE id = ?", (listing_id,))
                     row = c.fetchone()
 
                     if row is None:
-                        # Qualifies if between R7,500/m² and the user's max target threshold
                         should_notify = 1 if rate_sqm <= max_price_sqm else 0
                         
                         c.execute(
@@ -167,7 +162,7 @@ def run_scraper():
                 page += 1
 
             except Exception as e:
-                print(f"Error scraping {page_url}: {e}")
+                print(f"Error: {e}")
                 break
 
     conn.close()
