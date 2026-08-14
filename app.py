@@ -22,7 +22,7 @@ if st.button("🚀 Run Scraper & Market Engine", type="primary"):
 st.divider()
 
 try:
-    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE total_clean >= 20 ORDER BY suburb ASC", conn)
+    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE total_clean >= 5 ORDER BY suburb ASC", conn)
 except Exception:
     stats_df = pd.DataFrame()
 
@@ -30,7 +30,7 @@ if not stats_df.empty:
     suburbs = list(stats_df['suburb'].unique())
     
     st.sidebar.header("📍 Select Suburb")
-    selected_suburb = st.sidebar.selectbox("Suburbs (Volume >= 20):", suburbs)
+    selected_suburb = st.sidebar.selectbox("Detected Suburbs:", suburbs)
 
     sub_stats = stats_df[stats_df['suburb'] == selected_suburb].iloc[0]
 
@@ -73,7 +73,7 @@ if not stats_df.empty:
         else:
             st.info(f"No listings in {selected_suburb} met both the Top 2% and IQR distance criteria.")
 
-        with st.expander(f"👁️ View All Valid {selected_suburb} Properties (Cleaned)"):
+        with st.expander(f"👁️ View All Valid {selected_suburb} Properties ({total_clean_count} Cleaned)"):
             st.dataframe(clean_df[['rank_num', 'true_percentile', 'title', 'price', 'sqm', 'rate_sqm', 'url']], use_container_width=True)
 
 else:
