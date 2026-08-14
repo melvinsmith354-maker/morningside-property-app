@@ -124,7 +124,7 @@ def run_scraper():
     print(f"\n--- Scraping Morningside ---")
 
     page = 1
-    max_pages = 5  # Set to 5 pages for fast & reliable scraping
+    max_pages = 15  # 🚀 Increased to 15 to capture ALL 350+ listings across Morningside
     listings = []
 
     while page <= max_pages:
