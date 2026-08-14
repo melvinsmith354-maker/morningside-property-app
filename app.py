@@ -1,79 +1,60 @@
 import streamlit as st
-import pandas as pd
 import sqlite3
+import pandas as pd
+from scraper import init_db, run_scraper
 
-# Page setup for mobile screens
-st.set_page_config(page_title="Property24 R/m² Hunter", page_icon="🏡", layout="centered")
+st.set_page_config(page_title="P24 Rate Hunter", page_icon="🏡")
 
-def init_db():
-    conn = sqlite3.connect("property_app.db")
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_searches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_label TEXT,
-            p24_url TEXT,
-            max_price_sqm REAL
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS properties (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            price REAL,
-            floor_size REAL,
-            price_per_sqm REAL,
-            url TEXT,
-            date_found TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
+# Initialize Database
 init_db()
 
 st.title("🏡 P24 Rate-per-m² Hunter")
-st.caption("Calculate and filter Property24 listings by R/m²")
+st.write("Calculate and filter Property24 listings by R/m²")
 
 tab1, tab2 = st.tabs(["🔥 Active Deals", "⚙️ Add P24 Link"])
 
+conn = sqlite3.connect("properties.db")
+
 with tab2:
     st.subheader("Monitored Property24 Searches")
-    st.info("1. Go to Property24 on your phone.\n2. Filter by Morningside, Bedrooms, Price, etc.\n3. Paste the URL below.")
+    st.info("1. Go to Property24 on your phone/browser.\n2. Filter by area, beds, price, etc.\n3. Paste the URL below.")
     
-    label = st.text_input("Search Name", placeholder="Morningside 2 Bed Flats")
-    url = st.text_input("Property24 Link", placeholder="https://www.property24.com/for-sale/morningside/sandton/gauteng/4258")
-    target_rate = st.number_input("Target Max R / m²", value=10000, step=500)
-    
-    if st.button("💾 Save Search Alert", use_container_width=True):
-        if url and "property24.com" in url:
-            conn = sqlite3.connect("property_app.db")
-            c = conn.cursor()
-            c.execute("INSERT INTO user_searches (user_label, p24_url, max_price_sqm) VALUES (?, ?, ?)", (label, url, target_rate))
-            conn.commit()
-            conn.close()
-            st.success(f"Added monitoring for '{label}'!")
-        else:
-            st.error("Please provide a valid Property24 link.")
+    with st.form("add_search_form"):
+        search_name = st.text_input("Search Name", placeholder="Morningside 2 Bed Flats")
+        p24_url = st.text_input("Property24 Link", placeholder="https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258")
+        target_max = st.number_input("Target Max R / m²", value=10000, step=500)
+        submit = st.form_submit_button("💾 Save Search Alert")
+        
+        if submit:
+            if search_name and p24_url:
+                c = conn.cursor()
+                c.execute("INSERT INTO user_searches (search_name, p24_url, max_price_sqm) VALUES (?, ?, ?)",
+                          (search_name, p24_url, target_max))
+                conn.commit()
+                st.success("Search saved! Triggering initial scrape...")
+                run_scraper()
+                st.rerun()
+            else:
+                st.error("Please fill in all fields.")
 
 with tab1:
-    conn = sqlite3.connect("property_app.db")
-    df = pd.read_sql_query("SELECT * FROM properties ORDER BY price_per_sqm ASC", conn)
-    conn.close()
+    max_threshold = st.slider("Max R / m² Threshold", min_value=5000, max_value=30000, value=10000, step=500)
     
-    max_rate_filter = st.slider("Max R / m² Threshold", min_value=5000, max_value=20000, value=10000, step=500)
+    df = pd.read_sql_query("SELECT title, price, sqm, rate_sqm, url FROM listings", conn)
     
     if not df.empty:
-        filtered_df = df[df['price_per_sqm'] <= max_rate_filter]
-        st.metric("Deals Found", value=len(filtered_df))
-        
-        for _, row in filtered_df.iterrows():
-            with st.container():
-                st.markdown(f"### R {row['price']:,.0f}")
-                col1, col2 = st.columns(2)
-                col1.write(f"📐 **Size:** {row['floor_size']} m²")
-                col2.write(f"📊 **Rate:** **R {row['price_per_sqm']:,.2f} / m²**")
-                st.markdown(f"[👉 View Listing on Property24]({row['url']})")
+        filtered_df = df[df['rate_sqm'] <= max_threshold].sort_values(by="rate_sqm")
+        if not filtered_df.empty:
+            for _, row in filtered_df.iterrows():
+                st.markdown(f"### 📍 [{row['title']}]({row['url']})")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Price", f"R {row['price']:,.0f}")
+                col2.metric("Size", f"{row['sqm']:.0f} m²")
+                col3.metric("Rate / m²", f"R {row['rate_sqm']:,.2f}")
                 st.divider()
+        else:
+            st.warning("No listings currently match your selected threshold.")
     else:
         st.warning("No listings currently match or no data scraped yet.")
+
+conn.close()
