@@ -14,8 +14,11 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
+    c.execute("DROP TABLE IF EXISTS raw_listings")
+    c.execute("DROP TABLE IF EXISTS area_stats")
+
     c.execute('''
-        CREATE TABLE IF NOT EXISTS raw_listings (
+        CREATE TABLE raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
             suburb TEXT,
@@ -28,7 +31,7 @@ def init_db():
     ''')
     
     c.execute('''
-        CREATE TABLE IF NOT EXISTS area_stats (
+        CREATE TABLE area_stats (
             suburb TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
@@ -47,10 +50,12 @@ def clean_area_data(rates):
 
     rates = sorted(rates)
     
+    # Pass 1: Physical Reality Filter
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
 
+    # Pass 2: Isolation Gap Detection
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -72,6 +77,8 @@ def clean_area_data(rates):
     real_min = min(clean_rates)
     real_max = max(clean_rates)
     median_rate = float(np.median(clean_rates))
+    
+    # Top 2% Threshold Value
     top_2_thresh = float(np.percentile(clean_rates, 2))
 
     return clean_rates, real_min, real_max, median_rate, top_2_thresh
@@ -121,26 +128,27 @@ def run_scraper():
     suburb_name = "Morningside"
     base_url = MORNINGSIDE_URL.rstrip('/')
     
-    print(f"\n--- Scraping Morningside ---")
+    print(f"\n--- Scraping ALL Pages for Morningside ---")
 
     page = 1
-    max_pages = 15  # 🚀 Increased to 15 to capture ALL 350+ listings across Morningside
     listings = []
 
-    while page <= max_pages:
+    # Dynamic loop: keeps going until no more property cards exist
+    while True:
         page_url = base_url if page == 1 else f"{base_url}/p{page}"
         print(f"Scraping Page {page}...")
         
         try:
             res = requests.get(page_url, headers=headers, timeout=10)
             if res.status_code != 200:
-                print(f"Page {page} returned status {res.status_code}")
+                print(f"Reached end of pages or received HTTP {res.status_code}.")
                 break
 
             soup = BeautifulSoup(res.text, "html.parser")
             tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
             
             if not tiles:
+                print(f"No property tiles found on page {page}. Scraping complete.")
                 break
 
             for tile in tiles:
@@ -200,6 +208,7 @@ def run_scraper():
         return
 
     raw_count = len(listings)
+    print(f"Scraped {raw_count} total listings across all pages.")
 
     for item in listings:
         c.execute(
@@ -221,16 +230,19 @@ def run_scraper():
     )
     conn.commit()
 
-    for idx, item in enumerate(valid_items):
+    # Exact Top 2% Slice Count
+    top_2_count = int(np.ceil(total_clean * 0.02))
+
+    # Send Telegram alerts for exact Top 2% slice
+    for idx, item in enumerate(valid_items[:top_2_count]):
         rank_num = idx + 1
         true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
         pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
 
-        if item["rate_sqm"] <= top_2_thresh:
-            send_telegram_alert(
-                item["title"], suburb_name, item["price"], item["sqm"], 
-                item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
-            )
+        send_telegram_alert(
+            item["title"], suburb_name, item["price"], item["sqm"], 
+            item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
+        )
 
     conn.close()
 
