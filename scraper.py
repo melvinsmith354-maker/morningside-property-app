@@ -9,6 +9,7 @@ DB_NAME = "properties.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    # Table for stored user searches
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_searches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -17,6 +18,7 @@ def init_db():
             max_price_sqm REAL
         )
     ''')
+    # Table for scraped listings
     c.execute('''
         CREATE TABLE IF NOT EXISTS listings (
             id TEXT PRIMARY KEY,
@@ -36,7 +38,7 @@ def send_telegram_alert(title, price, sqm, rate_sqm, url):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
     if not token or not chat_id:
-        print("⚠️ Missing Telegram Token or Chat ID.")
+        print("⚠️ Missing Telegram Token or Chat ID environment variables.")
         return
 
     message = (
@@ -63,7 +65,8 @@ def send_telegram_alert(title, price, sqm, rate_sqm, url):
         print(f"❌ Failed to send Telegram alert: {e}")
 
 def run_scraper():
-    init_db()
+    init_db()  # Ensure database tables are ready
+    
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
@@ -71,7 +74,7 @@ def run_scraper():
     searches = c.fetchall()
     
     if not searches:
-        print("No searches saved in database.")
+        print("No user searches found in database.")
         conn.close()
         return
 
@@ -86,7 +89,7 @@ def run_scraper():
         clean_url = re.sub(r'/p\d+/?$', '', base_url.rstrip('/'))
 
         page = 1
-        max_pages = 10  # Safety limit: checks up to 10 pages per search
+        max_pages = 10  # Scrapes up to 10 pages per search
 
         while page <= max_pages:
             page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
@@ -135,16 +138,23 @@ def run_scraper():
                         sqm = float(sqm_digits) if sqm_digits else None
 
                     if not sqm or sqm <= 0:
-                        continue
+                        continue  # Skip entries with missing or zero floor area
 
                     rate_sqm = price / sqm
 
-                    # Database check & notification trigger
+                    # 🛑 FILTER: Ignore junk data, parking bays, storage units, or faulty sizes (< R7,500/m²)
+                    if rate_sqm < 7500:
+                        print(f"Skipping junk entry/anomaly: '{title}' at R{rate_sqm:,.2f}/m²")
+                        continue
+
+                    # Database check
                     c.execute("SELECT id FROM listings WHERE id = ?", (listing_id,))
                     row = c.fetchone()
 
                     if row is None:
+                        # Qualifies if between R7,500/m² and the user's max target threshold
                         should_notify = 1 if rate_sqm <= max_price_sqm else 0
+                        
                         c.execute(
                             "INSERT INTO listings (id, title, price, sqm, rate_sqm, url, notified) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (listing_id, title, price, sqm, rate_sqm, full_url, should_notify)
