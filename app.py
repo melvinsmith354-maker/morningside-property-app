@@ -22,7 +22,7 @@ if st.button("🚀 Run Scraper & Market Engine", type="primary"):
 st.divider()
 
 try:
-    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE total_clean >= 5 ORDER BY suburb ASC", conn)
+    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE total_clean >= 1 ORDER BY suburb ASC", conn)
 except Exception:
     stats_df = pd.DataFrame()
 
