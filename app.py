@@ -1,7 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-from scraper import init_db, run_scraper, MIN_SUBURB_VOLUME
+from scraper import init_db, run_scraper
 
 st.set_page_config(page_title="Multi-Suburb Property Hunter", page_icon="🏡", layout="wide")
 
@@ -81,6 +81,6 @@ if not stats_df.empty:
             st.dataframe(clean_df[['rank_num', 'true_percentile', 'title', 'price', 'sqm', 'rate_sqm', 'url']], use_container_width=True)
 
 else:
-    st.info("👋 No suburbs with >= 50 valid properties found yet. Click **🚀 Run Scraper & Market Engine** to analyze the region.")
+    st.info("👋 Welcome! Make sure **`scraper.py`** is updated in GitHub, then click **🚀 Run Scraper & Market Engine** above to run the analysis.")
 
 conn.close()
