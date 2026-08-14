@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import numpy as np
 import pandas as pd
 import streamlit as st
 from scraper import init_db, run_scraper
@@ -16,16 +17,14 @@ st.caption("Density Outlier Engine & Top 2% Value Tracker")
 
 conn = sqlite3.connect(DB_NAME)
 
-# Action button
 if st.button("🚀 Run Scraper & Market Engine", type="primary"):
-    with st.spinner("Scraping Morningside and processing market metrics..."):
+    with st.spinner("Scraping all Morningside pages and processing market metrics..."):
         run_scraper()
     st.success("Analysis complete!")
     st.rerun()
 
 st.divider()
 
-# Check DB contents
 try:
     stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE suburb='Morningside'", conn)
 except Exception:
@@ -51,20 +50,19 @@ if not stats_df.empty:
         raw_df = pd.DataFrame()
 
     if not raw_df.empty:
-        # Filter valid listings
         clean_df = raw_df[(raw_df['rate_sqm'] >= sub_stats['real_min']) & (raw_df['rate_sqm'] <= sub_stats['real_max'])].sort_values(by="rate_sqm").reset_index(drop=True)
         
-        # Denominator is strictly equal to Total Valid Listings (e.g., out of 164 or 350+)
         total_valid_count = int(sub_stats['total_clean'])
         
         clean_df['rank_num'] = clean_df.index + 1
         clean_df['true_percentile'] = (clean_df['rank_num'] / total_valid_count) * 100
         clean_df['pct_below_median'] = ((sub_stats['median_rate'] - clean_df['rate_sqm']) / sub_stats['median_rate']) * 100
 
-        # Top 2% properties
-        top_2_df = clean_df[clean_df['rate_sqm'] <= sub_stats['top_2_percentile']]
+        # Exact Top 2% count calculation (e.g. 2% of 497 = 10 properties)
+        top_2_limit = int(np.ceil(total_valid_count * 0.02))
+        top_2_df = clean_df.head(top_2_limit)
 
-        st.subheader(f"🔥 Top 2% Lowest Valid Properties ({len(top_2_df)} Found)")
+        st.subheader(f"🔥 Top 2% Lowest Valid Properties ({len(top_2_df)} Found out of {total_valid_count})")
         
         if not top_2_df.empty:
             for _, row in top_2_df.iterrows():
