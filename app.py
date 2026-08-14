@@ -8,17 +8,17 @@ from scraper import init_db, run_scraper
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "properties.db")
 
-st.set_page_config(page_title="Morningside Rate Hunter", page_icon="🏡", layout="wide")
+st.set_page_config(page_title="Apartment Rate Hunter", page_icon="🏢", layout="wide")
 
 init_db()
 
-st.title("🏡 Morningside Property24 Market Dashboard")
+st.title("🏢 Multi-Suburb Apartment Market Dashboard")
 st.caption("Density Outlier Engine & Top 2% Value Tracker")
 
 conn = sqlite3.connect(DB_NAME)
 
 if st.button("🚀 Run Scraper & Market Engine", type="primary"):
-    with st.spinner("Scraping all Morningside pages and processing market metrics..."):
+    with st.spinner("Scraping all apartment links and processing market metrics..."):
         run_scraper()
     st.success("Analysis complete!")
     st.rerun()
@@ -26,14 +26,19 @@ if st.button("🚀 Run Scraper & Market Engine", type="primary"):
 st.divider()
 
 try:
-    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE suburb='Morningside'", conn)
+    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE total_clean >= 1 ORDER BY suburb ASC", conn)
 except Exception:
     stats_df = pd.DataFrame()
 
 if not stats_df.empty:
-    sub_stats = stats_df.iloc[0]
+    suburbs = list(stats_df['suburb'].unique())
+    
+    st.sidebar.header("📍 Select Suburb")
+    selected_suburb = st.sidebar.selectbox("Suburbs Evaluated:", suburbs)
 
-    st.subheader("📊 Market Summary: Morningside")
+    sub_stats = stats_df[stats_df['suburb'] == selected_suburb].iloc[0]
+
+    st.subheader(f"📊 Market Summary: {selected_suburb}")
     col1, col2, col3, col4, col5 = st.columns(5)
     
     col1.metric("Total Listings Scraped", f"{int(sub_stats['total_raw'])}")
@@ -45,7 +50,7 @@ if not stats_df.empty:
     st.divider()
 
     try:
-        raw_df = pd.read_sql_query("SELECT * FROM raw_listings WHERE suburb='Morningside'", conn)
+        raw_df = pd.read_sql_query("SELECT * FROM raw_listings WHERE suburb=?", conn, params=(selected_suburb,))
     except Exception:
         raw_df = pd.DataFrame()
 
@@ -58,7 +63,7 @@ if not stats_df.empty:
         clean_df['true_percentile'] = (clean_df['rank_num'] / total_valid_count) * 100
         clean_df['pct_below_median'] = ((sub_stats['median_rate'] - clean_df['rate_sqm']) / sub_stats['median_rate']) * 100
 
-        # Exact Top 2% count calculation (e.g. 2% of 497 = 10 properties)
+        # Exact Top 2% calculation (e.g. 2% of 497 = 10 properties)
         top_2_limit = int(np.ceil(total_valid_count * 0.02))
         top_2_df = clean_df.head(top_2_limit)
 
@@ -75,14 +80,14 @@ if not stats_df.empty:
                 c5.metric("% Below Median", f"{row['pct_below_median']:.1f}% OFF", delta=f"-{row['pct_below_median']:.1f}%")
                 st.divider()
         else:
-            st.info("No listings fell within the Top 2% threshold.")
+            st.info(f"No listings in {selected_suburb} fell within the Top 2% threshold.")
 
-        with st.expander(f"👁️ View All {total_valid_count} Valid Morningside Properties"):
+        with st.expander(f"👁️ View All {total_valid_count} Valid {selected_suburb} Properties"):
             display_df = clean_df[['rank_num', 'true_percentile', 'pct_below_median', 'title', 'price', 'sqm', 'rate_sqm', 'url']].copy()
             display_df['pct_below_median'] = display_df['pct_below_median'].map(lambda x: f"{x:.1f}%")
             st.dataframe(display_df, use_container_width=True)
 
 else:
-    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the Morningside analysis.")
+    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the multi-suburb analysis.")
 
 conn.close()
