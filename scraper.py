@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
-# 🛠️ TEST AREA CONFIGURATION
+# 🛠️ AREA PRESET CONFIGURATION
 PRESET_SEARCHES = [
     {
         "name": "Morningside",
@@ -47,7 +47,7 @@ def init_db():
 def clean_area_data(rates):
     """
     2-Pass Density Isolation Engine:
-    1. Hard safety floor (R6,500/m²) and ceiling (R80,000/m²).
+    1. Physical reality boundary filter (R6,500/m² to R80,000/m²).
     2. Density gap isolation (filters isolated stray points on low/high ends).
     """
     if len(rates) < 5:
@@ -61,7 +61,6 @@ def clean_area_data(rates):
         filtered = rates
 
     # Pass 2: Isolation Gap Detection
-    # Calculate difference between consecutive sorted rates
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -90,7 +89,7 @@ def clean_area_data(rates):
 
     return clean_rates, real_min, real_max, top_5_thresh
 
-def send_telegram_alert(title, area, price, sqm, rate_sqm, percentile_rank, url):
+def send_telegram_alert(title, area, price, sqm, rate_sqm, true_percentile, rank_num, total_valid, url):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -102,7 +101,7 @@ def send_telegram_alert(title, area, price, sqm, rate_sqm, percentile_rank, url)
         f"🔥 *TOP 5% BARGAIN ALERT!*\n\n"
         f"📍 *Title:* {title}\n"
         f"🏷️ *Area:* {area}\n"
-        f"🏆 *Value Rank:* **Top {percentile_rank:.1f}%** best rate in area\n"
+        f"🏆 *Value Rank:* **Top {true_percentile:.1f}%** (#{rank_num} of {total_valid} in area)\n"
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
         f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n\n"
@@ -223,20 +222,28 @@ def run_scraper():
         rates = [x["rate_sqm"] for x in area_listings]
         clean_rates, real_min, real_max, top_5_thresh = clean_area_data(rates)
 
-        # Update stats
+        # Update area statistics
         c.execute(
             "INSERT OR REPLACE INTO area_stats (area, total_raw, total_clean, real_min, real_max, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?)",
             (search_name, len(rates), len(clean_rates), real_min, real_max, top_5_thresh)
         )
         conn.commit()
 
-        # Evaluate Top 5% deals & send alerts
-        for item in area_listings:
-            rate = item["rate_sqm"]
-            if real_min <= rate <= top_5_thresh:
-                # Calculate exact percentile rank relative to clean range
-                pct = ((rate - real_min) / (real_max - real_min)) * 100
-                send_telegram_alert(item["title"], search_name, item["price"], item["sqm"], rate, pct, item["url"])
+        # Process non-junk items & calculate TRUE ordinal percentiles
+        clean_area_items = [x for x in area_listings if real_min <= x["rate_sqm"] <= real_max]
+        clean_area_items.sort(key=lambda x: x["rate_sqm"])
+        total_valid = len(clean_area_items)
+
+        for idx, item in enumerate(clean_area_items):
+            rank_num = idx + 1
+            true_percentile = (rank_num / total_valid) * 100 if total_valid > 0 else 100.0
+
+            # Send Telegram alert if rate is within the Top 5% threshold
+            if item["rate_sqm"] <= top_5_thresh:
+                send_telegram_alert(
+                    item["title"], search_name, item["price"], item["sqm"], 
+                    item["rate_sqm"], true_percentile, rank_num, total_valid, item["url"]
+                )
 
     conn.close()
 
