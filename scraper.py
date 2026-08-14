@@ -14,12 +14,11 @@ PRESET_SEARCHES = [
     }
 ]
 
-MIN_SUBURB_VOLUME = 15  # Minimum listings required for a suburb to be analyzed
+MIN_SUBURB_VOLUME = 5  # Set low so all active suburbs show up cleanly
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Wipe old database tables completely on init to clear corrupted structure
     c.execute("DROP TABLE IF EXISTS raw_listings")
     c.execute("DROP TABLE IF EXISTS area_stats")
 
@@ -52,17 +51,17 @@ def init_db():
     conn.close()
 
 def clean_area_data(rates):
-    if len(rates) < 5:
+    if len(rates) < 3:
         return rates, min(rates) if rates else 0, max(rates) if rates else 0, 0, 0, 0
 
     rates = sorted(rates)
     
-    # Physical reality boundary filter
+    # Pass 1: Physical Reality Filter
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
 
-    # Density Gap Isolation
+    # Pass 2: Density Gap Isolation
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -126,18 +125,22 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def extract_suburb_from_url(url):
-    """
-    Extracts suburb directly from Property24 URL structure:
-    'https://www.property24.com/for-sale/buccleuch/sandton/gauteng/5255/117449372' -> 'Buccleuch'
-    """
-    match = re.search(r'/for-sale/([a-zA-Z0-9\-]+)/', url)
-    if match:
-        sub_slug = match.group(1).replace('-', ' ')
-        # Clean up general search tokens
-        if sub_slug not in ['advanced search', 'results', 'search']:
-            return sub_slug.title()
-    return "General Sandton"
+def parse_suburb(tile):
+    """ Extract suburb accurately from HTML location tag """
+    loc_tag = tile.find("span", class_=re.compile("p24_location|p24_address")) or \
+              tile.find("div", class_=re.compile("p24_location|p24_address")) or \
+              tile.find("span", class_="p24_description")
+              
+    if loc_tag:
+        text = loc_tag.text.strip()
+        parts = [p.strip() for p in text.split(",")]
+        if parts:
+            sub = parts[0].title()
+            # Clean unwanted prefixes
+            sub = re.sub(r'^(Apartment|Flat|House|Townhouse|Unit)\s+In\s+', '', sub, flags=re.IGNORECASE)
+            if 2 < len(sub) < 30:
+                return sub
+    return "Sandton Central"
 
 def run_scraper():
     init_db()
@@ -186,8 +189,7 @@ def run_scraper():
                     title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
                     title = title_tag.text.strip() if title_tag else "Property Listing"
 
-                    # 100% Reliable Suburb Extraction directly from URL
-                    suburb = extract_suburb_from_url(full_url)
+                    suburb = parse_suburb(tile)
 
                     price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
                     if not price_tag:
@@ -228,6 +230,7 @@ def run_scraper():
                 break
 
         if not all_area_listings:
+            print("No listings found!")
             continue
 
         for item in all_area_listings:
@@ -237,16 +240,15 @@ def run_scraper():
             )
         conn.commit()
 
-        # Group and Process by Real Suburb
+        # Group and Process by Suburb
         suburbs = set(x["suburb"] for x in all_area_listings)
-        print(f"Successfully Isolated Suburbs ({len(suburbs)}): {', '.join(sorted(suburbs))}")
+        print(f"Successfully Isolated {len(suburbs)} Suburbs: {', '.join(sorted(suburbs))}")
 
         for sub in suburbs:
             sub_items = [x for x in all_area_listings if x["suburb"] == sub]
             raw_count = len(sub_items)
             
             if raw_count < MIN_SUBURB_VOLUME:
-                print(f"Skipping {sub}: volume too low ({raw_count} < {MIN_SUBURB_VOLUME})")
                 continue
 
             rates = [x["rate_sqm"] for x in sub_items]
@@ -256,7 +258,7 @@ def run_scraper():
             valid_sub_items.sort(key=lambda x: x["rate_sqm"])
             total_clean = len(valid_sub_items)
 
-            if total_clean < 5:
+            if total_clean < 1:
                 continue
 
             c.execute(
