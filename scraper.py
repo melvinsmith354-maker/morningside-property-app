@@ -2,55 +2,107 @@ import os
 import re
 import sqlite3
 import requests
+import numpy as np
 from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
-# 🛠️ EDIT YOUR PRESET SEARCHES & RULES HERE
+# 🛠️ TEST AREA CONFIGURATION
 PRESET_SEARCHES = [
     {
-        "name": "Morningside Apartments",
-        "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258",
-        "max_rate": 12000  # Notify if rate <= R12,000/m²
-    },
-    # You can add more areas easily! Just uncomment and edit:
-    # {
-    #     "name": "Sandown Apartments",
-    #     "url": "https://www.property24.com/apartments-for-sale/sandown/sandton/gauteng/4259",
-    #     "max_rate": 11500
-    # }
+        "name": "Morningside",
+        "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"
+    }
 ]
-
-MIN_JUNK_THRESHOLD = 7500  # Automatically ignore anything under R7,500/m²
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    # Stores raw scraped listings
     c.execute('''
-        CREATE TABLE IF NOT EXISTS listings (
+        CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
+            area TEXT,
             title TEXT,
             price REAL,
             sqm REAL,
             rate_sqm REAL,
-            url TEXT,
-            notified INTEGER DEFAULT 0
+            url TEXT
+        )
+    ''')
+    # Stores area statistics (calculated real min, real max, top 5% threshold)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS area_stats (
+            area TEXT PRIMARY KEY,
+            total_raw INTEGER,
+            total_clean INTEGER,
+            real_min REAL,
+            real_max REAL,
+            top_5_percentile REAL
         )
     ''')
     conn.commit()
     conn.close()
 
-def send_telegram_alert(title, price, sqm, rate_sqm, url):
+def clean_area_data(rates):
+    """
+    2-Pass Density Isolation Engine:
+    1. Hard safety floor (R6,500/m²) and ceiling (R80,000/m²).
+    2. Density gap isolation (filters isolated stray points on low/high ends).
+    """
+    if len(rates) < 5:
+        return rates, min(rates) if rates else 0, max(rates) if rates else 0, min(rates) if rates else 0
+
+    rates = sorted(rates)
+    
+    # Pass 1: Physical Reality Filter
+    filtered = [r for r in rates if 6500 <= r <= 80000]
+    if not filtered:
+        filtered = rates
+
+    # Pass 2: Isolation Gap Detection
+    # Calculate difference between consecutive sorted rates
+    diffs = np.diff(filtered)
+    median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
+
+    # Low End Cutoff: Find where consecutive gap is > 4x median gap
+    low_idx = 0
+    for i in range(min(5, len(diffs))):
+        if diffs[i] > max(1500, median_diff * 4):
+            low_idx = i + 1
+
+    # High End Cutoff
+    high_idx = len(filtered)
+    for i in range(len(diffs) - 1, max(len(diffs) - 5, 0), -1):
+        if diffs[i] > max(3000, median_diff * 4):
+            high_idx = i + 1
+            break
+
+    clean_rates = filtered[low_idx:high_idx]
+    if not clean_rates:
+        clean_rates = filtered
+
+    real_min = min(clean_rates)
+    real_max = max(clean_rates)
+    
+    # Calculate 5th percentile threshold
+    top_5_thresh = float(np.percentile(clean_rates, 5))
+
+    return clean_rates, real_min, real_max, top_5_thresh
+
+def send_telegram_alert(title, area, price, sqm, rate_sqm, percentile_rank, url):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
     if not token or not chat_id:
-        print("⚠️ Missing Telegram secrets.")
+        print("⚠️ Missing Telegram credentials.")
         return
 
     message = (
-        f"🔥 *BARGAIN PROPERTY ALERT!*\n\n"
+        f"🔥 *TOP 5% BARGAIN ALERT!*\n\n"
         f"📍 *Title:* {title}\n"
+        f"🏷️ *Area:* {area}\n"
+        f"🏆 *Value Rank:* **Top {percentile_rank:.1f}%** best rate in area\n"
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
         f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n\n"
@@ -83,17 +135,17 @@ def run_scraper():
     for search in PRESET_SEARCHES:
         search_name = search["name"]
         base_url = search["url"]
-        max_price_sqm = search["max_rate"]
         
-        print(f"\n--- Starting Search: {search_name} ---")
+        print(f"\n--- Scraping Area: {search_name} ---")
         clean_url = re.sub(r'/p\d+/?$', '', base_url.rstrip('/'))
 
         page = 1
-        max_pages = 10  # Scrapes up to 10 pages per area
+        max_pages = 10
+        area_listings = []
 
         while page <= max_pages:
             page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
-            print(f"Scraping Page {page}: {page_url}")
+            print(f"Scraping Page {page}...")
             
             try:
                 res = requests.get(page_url, headers=headers, timeout=10)
@@ -140,30 +192,51 @@ def run_scraper():
 
                     rate_sqm = price / sqm
 
-                    # 🛑 FILTER: Ignore junk entries (< R7,500/m²)
-                    if rate_sqm < MIN_JUNK_THRESHOLD:
-                        continue
-
-                    c.execute("SELECT id FROM listings WHERE id = ?", (listing_id,))
-                    row = c.fetchone()
-
-                    if row is None:
-                        should_notify = 1 if rate_sqm <= max_price_sqm else 0
-                        
-                        c.execute(
-                            "INSERT INTO listings (id, title, price, sqm, rate_sqm, url, notified) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (listing_id, title, price, sqm, rate_sqm, full_url, should_notify)
-                        )
-                        conn.commit()
-                        
-                        if should_notify == 1:
-                            send_telegram_alert(title, price, sqm, rate_sqm, full_url)
+                    area_listings.append({
+                        "id": listing_id,
+                        "area": search_name,
+                        "title": title,
+                        "price": price,
+                        "sqm": sqm,
+                        "rate_sqm": rate_sqm,
+                        "url": full_url
+                    })
 
                 page += 1
 
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error scraping {page_url}: {e}")
                 break
+
+        if not area_listings:
+            continue
+
+        # Save all raw listings to database
+        for item in area_listings:
+            c.execute(
+                "INSERT OR REPLACE INTO raw_listings (id, area, title, price, sqm, rate_sqm, url) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (item["id"], item["area"], item["title"], item["price"], item["sqm"], item["rate_sqm"], item["url"])
+            )
+        conn.commit()
+
+        # Run Density Cleaner
+        rates = [x["rate_sqm"] for x in area_listings]
+        clean_rates, real_min, real_max, top_5_thresh = clean_area_data(rates)
+
+        # Update stats
+        c.execute(
+            "INSERT OR REPLACE INTO area_stats (area, total_raw, total_clean, real_min, real_max, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?)",
+            (search_name, len(rates), len(clean_rates), real_min, real_max, top_5_thresh)
+        )
+        conn.commit()
+
+        # Evaluate Top 5% deals & send alerts
+        for item in area_listings:
+            rate = item["rate_sqm"]
+            if real_min <= rate <= top_5_thresh:
+                # Calculate exact percentile rank relative to clean range
+                pct = ((rate - real_min) / (real_max - real_min)) * 100
+                send_telegram_alert(item["title"], search_name, item["price"], item["sqm"], rate, pct, item["url"])
 
     conn.close()
 
