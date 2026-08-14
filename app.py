@@ -3,18 +3,18 @@ import sqlite3
 import pandas as pd
 from scraper import init_db, run_scraper
 
-st.set_page_config(page_title="Multi-Suburb Property Hunter", page_icon="🏡", layout="wide")
+st.set_page_config(page_title="Property Hunter Dashboard", page_icon="🏡", layout="wide")
 
 init_db()
 
 st.title("🏡 Multi-Suburb Property24 Market Dashboard")
-st.caption("2-Pass Density Isolation, IQR Median Cutoff & Top 2% Engine")
+st.caption("Statistical Density Cleaning & Top 2% Value Engine")
 
 conn = sqlite3.connect("properties.db")
 
 # Run Scraper Engine Button
 if st.button("🚀 Run Scraper & Market Engine", type="primary"):
-    with st.spinner("Scraping all pages across regions and isolating suburbs..."):
+    with st.spinner("Scraping suburbs and updating statistics..."):
         run_scraper()
     st.success("Analysis complete!")
     st.rerun()
@@ -29,19 +29,19 @@ except Exception:
 if not stats_df.empty:
     suburbs = list(stats_df['suburb'].unique())
     
-    st.sidebar.header("📍 Select Suburb")
-    selected_suburb = st.sidebar.selectbox("Detected Suburbs:", suburbs)
+    st.sidebar.header("📍 Suburb Navigator")
+    selected_suburb = st.sidebar.selectbox("Select Suburb:", suburbs)
 
     sub_stats = stats_df[stats_df['suburb'] == selected_suburb].iloc[0]
 
     st.subheader(f"📊 Market Summary: {selected_suburb}")
     col1, col2, col3, col4, col5 = st.columns(5)
     
-    col1.metric("Valid Volume", f"{int(sub_stats['total_clean'])}")
-    col2.metric("Real Min Rate", f"R {sub_stats['real_min']:,.2f} / m²")
-    col3.metric("Median Rate (Q2)", f"R {sub_stats['median_rate']:,.2f} / m²")
-    col4.metric("IQR Cutoff", f"R {sub_stats['iqr_cutoff']:,.2f} / m²")
-    col5.metric("Top 2% Ceiling", f"R {sub_stats['top_2_percentile']:,.2f} / m²")
+    col1.metric("Total Scraped Listings", f"{int(sub_stats['total_raw'])}")
+    col2.metric("Total Valid Listings", f"{int(sub_stats['total_clean'])}")
+    col3.metric("Minimum Valid Rate", f"R {sub_stats['real_min']:,.2f} / m²")
+    col4.metric("Median Rate (Q2)", f"R {sub_stats['median_rate']:,.2f} / m²")
+    col5.metric("Top 2% Bargain Ceiling", f"R {sub_stats['top_2_percentile']:,.2f} / m²")
 
     st.divider()
 
@@ -56,27 +56,35 @@ if not stats_df.empty:
         total_clean_count = len(clean_df)
         clean_df['rank_num'] = clean_df.index + 1
         clean_df['true_percentile'] = (clean_df['rank_num'] / total_clean_count) * 100
+        
+        # % Below Median Calculation
+        clean_df['pct_below_median'] = ((sub_stats['median_rate'] - clean_df['rate_sqm']) / sub_stats['median_rate']) * 100
 
+        # Filter strictly for Top 2% properties below IQR Cutoff
         top_2_df = clean_df[(clean_df['rate_sqm'] <= sub_stats['top_2_percentile']) & (clean_df['rate_sqm'] <= sub_stats['iqr_cutoff'])]
 
-        st.subheader(f"🔥 Top 2% Bargains in {selected_suburb} ({len(top_2_df)} Found)")
+        st.subheader(f"🔥 Top 2% Lowest Valid Bargains in {selected_suburb} ({len(top_2_df)} Found)")
         
         if not top_2_df.empty:
             for _, row in top_2_df.iterrows():
                 st.markdown(f"### 📍 [{row['title']}]({row['url']})")
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Price", f"R {row['price']:,.0f}")
                 c2.metric("Size", f"{row['sqm']:.0f} m²")
                 c3.metric("Rate / m²", f"R {row['rate_sqm']:,.2f}")
                 c4.metric("Value Rank", f"Top {row['true_percentile']:.1f}% (#{int(row['rank_num'])} of {total_clean_count})")
+                c5.metric("Below Median", f"{row['pct_below_median']:.1f}% OFF", delta=f"-{row['pct_below_median']:.1f}%")
                 st.divider()
         else:
             st.info(f"No listings in {selected_suburb} met both the Top 2% and IQR distance criteria.")
 
-        with st.expander(f"👁️ View All Valid {selected_suburb} Properties ({total_clean_count} Cleaned)"):
-            st.dataframe(clean_df[['rank_num', 'true_percentile', 'title', 'price', 'sqm', 'rate_sqm', 'url']], use_container_width=True)
+        with st.expander(f"👁️ View All {total_clean_count} Cleaned Listings for {selected_suburb}"):
+            # Reorder display columns to include % Below Median cleanly
+            display_df = clean_df[['rank_num', 'true_percentile', 'pct_below_median', 'title', 'price', 'sqm', 'rate_sqm', 'url']].copy()
+            display_df['pct_below_median'] = display_df['pct_below_median'].map(lambda x: f"{x:.1f}%")
+            st.dataframe(display_df, use_container_width=True)
 
 else:
-    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the multi-suburb analysis.")
+    st.info("👋 Welcome! Click **🚀 Run Scraper & Market Engine** above to run the analysis.")
 
 conn.close()
