@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
-# 🛠️ YOUR MULTI-SUBURB SEARCH LINK
+# 🛠️ YOUR COMBINED MULTI-SUBURB SEARCH LINK
 PRESET_SEARCHES = [
     {
         "name": "Combined Monitored Region",
@@ -15,11 +15,22 @@ PRESET_SEARCHES = [
     }
 ]
 
-MIN_SUBURB_VOLUME = 50  # Must have at least 50 valid listings
+MIN_SUBURB_VOLUME = 50  # Requires at least 50 valid listings
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    
+    # 🛠️ AUTO MIGRATION SAFEGUARD: Drop old incompatible tables if missing new columns
+    c.execute("PRAGMA table_info(raw_listings)")
+    cols = [col[1] for col in c.fetchall()]
+    if cols and "suburb" not in cols:
+        print("⚠️ Outdated database schema detected. Rebuilding table structures...")
+        c.execute("DROP TABLE IF EXISTS raw_listings")
+        c.execute("DROP TABLE IF EXISTS area_stats")
+        c.execute("DROP TABLE IF EXISTS listings")
+
+    # Table for raw scraped listings
     c.execute('''
         CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
@@ -32,6 +43,8 @@ def init_db():
             url TEXT
         )
     ''')
+    
+    # Table for calculated area statistics
     c.execute('''
         CREATE TABLE IF NOT EXISTS area_stats (
             suburb TEXT PRIMARY KEY,
@@ -49,7 +62,7 @@ def init_db():
 
 def clean_area_data(rates):
     """
-    2-Pass Density Isolation Engine + IQR Thresholds
+    2-Pass Density Isolation Engine + IQR Threshold Calculation
     """
     if len(rates) < MIN_SUBURB_VOLUME:
         return rates, min(rates) if rates else 0, max(rates) if rates else 0, 0, 0, 0
@@ -84,7 +97,7 @@ def clean_area_data(rates):
     real_max = max(clean_rates)
     median_rate = float(np.median(clean_rates))
     
-    # IQR Stats
+    # IQR Calculations
     q25 = np.percentile(clean_rates, 25)
     q75 = np.percentile(clean_rates, 75)
     iqr = q75 - q25
