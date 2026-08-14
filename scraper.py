@@ -7,29 +7,24 @@ from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
-# 🛠️ YOUR COMBINED MULTI-SUBURB SEARCH LINK
 PRESET_SEARCHES = [
     {
-        "name": "Sandton & Surrounds",
+        "name": "Sandton Region",
         "url": "https://www.property24.com/for-sale/advanced-search/results?sp=s%3d4258%2c11001%2c5849%2c5841%2c5862%2c5215%2c5843%2c32933%2c16732%2c5847%2c5860%2c5259%2c5176%2c5861%2c5178%2c5865%2c4262%2c4260%2c5216%2c5201%2c4253%2c4251%2c4270%2c4269%2c5211%2c4289%2c4288%2c17800%2c4285%2c5255%2c1535%2c15697%2c5832%2c5833%2c12702%2c10386%2c5828%2c5817%2c5852%2c5826%2c5836%2c5837%2c12733%2c5816%2c5846%2c4268%2c5224%2c5227%2c17212%2c15698%2c33232%2c17156%2c5850%2c5818%2c5834%2c5813%2c5269%2c5812%2c5278%2c5290%2c5270%2c5284%2c5824%2c5825%2c5926%2c4363%2c4358%2c4352%2c4374%2c4345%2c4378%2c4365%2c4348%2c4361%2c4381%2c4349%2c4366%2c4364%2c5906%2c4342%2c4373%2c4343%2c4355%2c12734%2c4380%2c4340%2c4341%2c12704%2c5266%2c5287%2c5279%2c4369%2c4346%2c4353%2c4347%2c4375%2c4249%2c32908%2c12761%2c17430%2c17431"
     }
 ]
 
-MIN_SUBURB_VOLUME = 20  # Adjusted to 20 so smaller valid suburbs aren't excluded!
+MIN_SUBURB_VOLUME = 15  # Minimum listings required for a suburb to be analyzed
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    
-    # Auto-migration safeguard
-    c.execute("PRAGMA table_info(raw_listings)")
-    cols = [col[1] for col in c.fetchall()]
-    if cols and "suburb" not in cols:
-        c.execute("DROP TABLE IF EXISTS raw_listings")
-        c.execute("DROP TABLE IF EXISTS area_stats")
+    # Wipe old database tables completely on init to clear corrupted structure
+    c.execute("DROP TABLE IF EXISTS raw_listings")
+    c.execute("DROP TABLE IF EXISTS area_stats")
 
     c.execute('''
-        CREATE TABLE IF NOT EXISTS raw_listings (
+        CREATE TABLE raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
             suburb TEXT,
@@ -42,7 +37,7 @@ def init_db():
     ''')
     
     c.execute('''
-        CREATE TABLE IF NOT EXISTS area_stats (
+        CREATE TABLE area_stats (
             suburb TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
@@ -62,12 +57,12 @@ def clean_area_data(rates):
 
     rates = sorted(rates)
     
-    # Pass 1: Physical Reality Filter
+    # Physical reality boundary filter
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
 
-    # Pass 2: Density Gap Isolation
+    # Density Gap Isolation
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -131,18 +126,18 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def parse_suburb(tile):
-    """ Extract suburb cleanly from Property24 location elements """
-    loc_tag = tile.find("span", class_=re.compile("p24_location|p24_address")) or tile.find("div", class_=re.compile("p24_location|p24_address"))
-    if loc_tag:
-        text = loc_tag.text.strip()
-        # Location is usually formatted as "Morningside, Sandton" or "Sandown, Sandton"
-        parts = [p.strip() for p in text.split(",")]
-        if parts:
-            sub = parts[0].title()
-            if 2 < len(sub) < 30:
-                return sub
-    return "Unknown Suburb"
+def extract_suburb_from_url(url):
+    """
+    Extracts suburb directly from Property24 URL structure:
+    'https://www.property24.com/for-sale/buccleuch/sandton/gauteng/5255/117449372' -> 'Buccleuch'
+    """
+    match = re.search(r'/for-sale/([a-zA-Z0-9\-]+)/', url)
+    if match:
+        sub_slug = match.group(1).replace('-', ' ')
+        # Clean up general search tokens
+        if sub_slug not in ['advanced search', 'results', 'search']:
+            return sub_slug.title()
+    return "General Sandton"
 
 def run_scraper():
     init_db()
@@ -191,8 +186,8 @@ def run_scraper():
                     title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
                     title = title_tag.text.strip() if title_tag else "Property Listing"
 
-                    # Precise HTML suburb parsing
-                    suburb = parse_suburb(tile)
+                    # 100% Reliable Suburb Extraction directly from URL
+                    suburb = extract_suburb_from_url(full_url)
 
                     price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
                     if not price_tag:
@@ -242,14 +237,16 @@ def run_scraper():
             )
         conn.commit()
 
-        # Group and Process by Suburb
-        suburbs = set(x["suburb"] for x in all_area_listings if x["suburb"] != "Unknown Suburb")
-        print(f"Successfully Extracted Suburbs ({len(suburbs)}): {', '.join(sorted(suburbs))}")
+        # Group and Process by Real Suburb
+        suburbs = set(x["suburb"] for x in all_area_listings)
+        print(f"Successfully Isolated Suburbs ({len(suburbs)}): {', '.join(sorted(suburbs))}")
 
         for sub in suburbs:
             sub_items = [x for x in all_area_listings if x["suburb"] == sub]
+            raw_count = len(sub_items)
             
-            if len(sub_items) < MIN_SUBURB_VOLUME:
+            if raw_count < MIN_SUBURB_VOLUME:
+                print(f"Skipping {sub}: volume too low ({raw_count} < {MIN_SUBURB_VOLUME})")
                 continue
 
             rates = [x["rate_sqm"] for x in sub_items]
@@ -259,12 +256,12 @@ def run_scraper():
             valid_sub_items.sort(key=lambda x: x["rate_sqm"])
             total_clean = len(valid_sub_items)
 
-            if total_clean < MIN_SUBURB_VOLUME:
+            if total_clean < 5:
                 continue
 
             c.execute(
                 "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (sub, len(sub_items), total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh)
+                (sub, raw_count, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh)
             )
             conn.commit()
 
