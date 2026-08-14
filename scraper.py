@@ -7,14 +7,25 @@ from bs4 import BeautifulSoup
 
 DB_NAME = "properties.db"
 
+# 🛠️ DIRECT DEDICATED SUBURB URLS
 PRESET_SEARCHES = [
-    {
-        "name": "Sandton Region",
-        "url": "https://www.property24.com/for-sale/advanced-search/results?sp=s%3d4258%2c11001%2c5849%2c5841%2c5862%2c5215%2c5843%2c32933%2c16732%2c5847%2c5860%2c5259%2c5176%2c5861%2c5178%2c5865%2c4262%2c4260%2c5216%2c5201%2c4253%2c4251%2c4270%2c4269%2c5211%2c4289%2c4288%2c17800%2c4285%2c5255%2c1535%2c15697%2c5832%2c5833%2c12702%2c10386%2c5828%2c5817%2c5852%2c5826%2c5836%2c5837%2c12733%2c5816%2c5846%2c4268%2c5224%2c5227%2c17212%2c15698%2c33232%2c17156%2c5850%2c5818%2c5834%2c5813%2c5269%2c5812%2c5278%2c5290%2c5270%2c5284%2c5824%2c5825%2c5926%2c4363%2c4358%2c4352%2c4374%2c4345%2c4378%2c4365%2c4348%2c4361%2c4381%2c4349%2c4366%2c4364%2c5906%2c4342%2c4373%2c4343%2c4355%2c12734%2c4380%2c4340%2c4341%2c12704%2c5266%2c5287%2c5279%2c4369%2c4346%2c4353%2c4347%2c4375%2c4249%2c32908%2c12761%2c17430%2c17431"
-    }
+    {"name": "Morningside", "url": "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258"},
+    {"name": "Bryanston", "url": "https://www.property24.com/for-sale/bryanston/sandton/gauteng/5176"},
+    {"name": "Sandhurst", "url": "https://www.property24.com/for-sale/sandhurst/sandton/gauteng/5847"},
+    {"name": "Sandton Central", "url": "https://www.property24.com/for-sale/sandton-central/sandton/gauteng/16732"},
+    {"name": "Hyde Park", "url": "https://www.property24.com/for-sale/hyde-park/sandton/gauteng/5832"},
+    {"name": "Hurlingham", "url": "https://www.property24.com/for-sale/hurlingham/sandton/gauteng/5860"},
+    {"name": "Sandown", "url": "https://www.property24.com/for-sale/sandown/sandton/gauteng/5178"},
+    {"name": "Benmore Gardens", "url": "https://www.property24.com/for-sale/benmore-gardens/sandton/gauteng/11001"},
+    {"name": "Edenburg", "url": "https://www.property24.com/for-sale/edenburg/sandton/gauteng/4253"},
+    {"name": "Houghton Estate", "url": "https://www.property24.com/for-sale/houghton-estate/johannesburg/gauteng/5926"},
+    {"name": "Linden", "url": "https://www.property24.com/for-sale/linden/randburg/gauteng/5779"},
+    {"name": "Illovo", "url": "https://www.property24.com/for-sale/illovo/sandton/gauteng/5833"},
+    {"name": "Melrose", "url": "https://www.property24.com/for-sale/melrose/johannesburg/gauteng/5837"},
+    {"name": "Woodmead", "url": "https://www.property24.com/for-sale/woodmead/sandton/gauteng/4288"},
+    {"name": "Sunninghill", "url": "https://www.property24.com/for-sale/sunninghill/sandton/gauteng/4289"},
+    {"name": "Waterfall", "url": "https://www.property24.com/for-sale/waterfall/midrand/gauteng/1535"}
 ]
-
-MIN_SUBURB_VOLUME = 5  # Set low so all active suburbs show up cleanly
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -92,7 +103,7 @@ def clean_area_data(rates):
 
     return clean_rates, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh
 
-def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, url):
+def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -105,6 +116,7 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
         f"📍 *Title:* {title}\n"
         f"🏷️ *Suburb:* {suburb}\n"
         f"🏆 *Value Rank:* **Top {true_percentile:.1f}%** (#{rank_num} of {total_clean} in {suburb})\n"
+        f"📉 *Discount:* **{pct_below_median:.1f}% below suburb median**\n"
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
         f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n\n"
@@ -125,23 +137,6 @@ def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, ra
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def parse_suburb(tile):
-    """ Extract suburb accurately from HTML location tag """
-    loc_tag = tile.find("span", class_=re.compile("p24_location|p24_address")) or \
-              tile.find("div", class_=re.compile("p24_location|p24_address")) or \
-              tile.find("span", class_="p24_description")
-              
-    if loc_tag:
-        text = loc_tag.text.strip()
-        parts = [p.strip() for p in text.split(",")]
-        if parts:
-            sub = parts[0].title()
-            # Clean unwanted prefixes
-            sub = re.sub(r'^(Apartment|Flat|House|Townhouse|Unit)\s+In\s+', '', sub, flags=re.IGNORECASE)
-            if 2 < len(sub) < 30:
-                return sub
-    return "Sandton Central"
-
 def run_scraper():
     init_db()
     conn = sqlite3.connect(DB_NAME)
@@ -152,18 +147,18 @@ def run_scraper():
     }
 
     for search in PRESET_SEARCHES:
-        search_name = search["name"]
+        suburb_name = search["name"]
         base_url = search["url"]
         
-        print(f"\n--- Scraping All Pages Across Region ---")
+        print(f"\n--- Scraping Suburb: {suburb_name} ---")
 
         page = 1
-        max_pages = 10
-        all_area_listings = []
+        max_pages = 5  # Scrapes up to 5 pages per suburb
+        suburb_listings = []
 
         while page <= max_pages:
-            page_url = f"{base_url}&p={page}" if page > 1 else base_url
-            print(f"Scraping Page {page}...")
+            clean_url = re.sub(r'/p\d+/?$', '', base_url.rstrip('/'))
+            page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
             
             try:
                 res = requests.get(page_url, headers=headers, timeout=10)
@@ -189,8 +184,6 @@ def run_scraper():
                     title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
                     title = title_tag.text.strip() if title_tag else "Property Listing"
 
-                    suburb = parse_suburb(tile)
-
                     price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
                     if not price_tag:
                         continue
@@ -212,10 +205,10 @@ def run_scraper():
 
                     rate_sqm = price / sqm
 
-                    all_area_listings.append({
+                    suburb_listings.append({
                         "id": listing_id,
-                        "area": search_name,
-                        "suburb": suburb,
+                        "area": "Gauteng",
+                        "suburb": suburb_name,
                         "title": title,
                         "price": price,
                         "sqm": sqm,
@@ -226,56 +219,51 @@ def run_scraper():
                 page += 1
 
             except Exception as e:
-                print(f"Error on page {page}: {e}")
+                print(f"Error scraping {suburb_name} page {page}: {e}")
                 break
 
-        if not all_area_listings:
-            print("No listings found!")
+        if not suburb_listings:
             continue
 
-        for item in all_area_listings:
+        raw_count = len(suburb_listings)
+
+        for item in suburb_listings:
             c.execute(
                 "INSERT OR REPLACE INTO raw_listings (id, area, suburb, title, price, sqm, rate_sqm, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (item["id"], item["area"], item["suburb"], item["title"], item["price"], item["sqm"], item["rate_sqm"], item["url"])
             )
         conn.commit()
 
-        # Group and Process by Suburb
-        suburbs = set(x["suburb"] for x in all_area_listings)
-        print(f"Successfully Isolated {len(suburbs)} Suburbs: {', '.join(sorted(suburbs))}")
+        # Clean & Process per Suburb
+        rates = [x["rate_sqm"] for x in suburb_listings]
+        clean_rates, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh = clean_area_data(rates)
 
-        for sub in suburbs:
-            sub_items = [x for x in all_area_listings if x["suburb"] == sub]
-            raw_count = len(sub_items)
+        valid_items = [x for x in suburb_listings if real_min <= x["rate_sqm"] <= real_max]
+        valid_items.sort(key=lambda x: x["rate_sqm"])
+        total_clean = len(valid_items)
+
+        if total_clean < 1:
+            continue
+
+        c.execute(
+            "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (suburb_name, raw_count, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh)
+        )
+        conn.commit()
+
+        # Telegram Alerts (Top 2% + IQR verified)
+        for idx, item in enumerate(valid_items):
+            rank_num = idx + 1
+            true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
             
-            if raw_count < MIN_SUBURB_VOLUME:
-                continue
+            # Calculate % below median
+            pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
 
-            rates = [x["rate_sqm"] for x in sub_items]
-            clean_rates, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh = clean_area_data(rates)
-
-            valid_sub_items = [x for x in sub_items if real_min <= x["rate_sqm"] <= real_max]
-            valid_sub_items.sort(key=lambda x: x["rate_sqm"])
-            total_clean = len(valid_sub_items)
-
-            if total_clean < 1:
-                continue
-
-            c.execute(
-                "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (sub, raw_count, total_clean, real_min, real_max, median_rate, iqr_cutoff, top_2_thresh)
-            )
-            conn.commit()
-
-            for idx, item in enumerate(valid_sub_items):
-                rank_num = idx + 1
-                true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
-
-                if item["rate_sqm"] <= top_2_thresh and item["rate_sqm"] <= iqr_cutoff:
-                    send_telegram_alert(
-                        item["title"], sub, item["price"], item["sqm"], 
-                        item["rate_sqm"], true_percentile, rank_num, total_clean, item["url"]
-                    )
+            if item["rate_sqm"] <= top_2_thresh and item["rate_sqm"] <= iqr_cutoff:
+                send_telegram_alert(
+                    item["title"], suburb_name, item["price"], item["sqm"], 
+                    item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
+                )
 
     conn.close()
 
