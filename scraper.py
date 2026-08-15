@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "properties.db")
 
-MORNINGSIDE_URL = "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258"
+MORNINGSIDE_URL = "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
