@@ -32,7 +32,6 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # 1. Base table creation
     c.execute('''
         CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
@@ -47,13 +46,13 @@ def init_db():
         )
     ''')
 
-    # 🛠️ AUTO-MIGRATION: Check if 'suburb' column exists in old DB files
+    # 🛠️ AUTO-MIGRATION: Check if 'suburb' exists, if not, add it and assign old records to Morningside
     c.execute("PRAGMA table_info(raw_listings)")
     columns = [col[1] for col in c.fetchall()]
     if "suburb" not in columns:
         c.execute("ALTER TABLE raw_listings ADD COLUMN suburb TEXT")
+        c.execute("UPDATE raw_listings SET suburb = 'Morningside' WHERE suburb IS NULL")
     
-    # Re-align area_stats table schema
     c.execute("PRAGMA table_info(area_stats)")
     area_columns = [col[1] for col in c.fetchall()]
     if "suburb" not in area_columns or "id" in area_columns:
@@ -305,7 +304,8 @@ def run_scraper(max_pages=50):
 
         clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
 
-        c.execute("SELECT * FROM raw_listings WHERE suburb=?", (suburb_name,))
+        # 🛠️ THE FIX: Explicitly name the columns here so the order is guaranteed!
+        c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
         all_db_items = []
         for row in c.fetchall():
             all_db_items.append({
