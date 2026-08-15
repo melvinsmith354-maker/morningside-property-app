@@ -32,8 +32,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # 🛑 NO DROP TABLE commands so data persists across runs
-    
+    # 1. Base table creation
     c.execute('''
         CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
@@ -47,7 +46,19 @@ def init_db():
             url TEXT
         )
     ''')
+
+    # 🛠️ AUTO-MIGRATION: Check if 'suburb' column exists in old DB files
+    c.execute("PRAGMA table_info(raw_listings)")
+    columns = [col[1] for col in c.fetchall()]
+    if "suburb" not in columns:
+        c.execute("ALTER TABLE raw_listings ADD COLUMN suburb TEXT")
     
+    # Re-align area_stats table schema
+    c.execute("PRAGMA table_info(area_stats)")
+    area_columns = [col[1] for col in c.fetchall()]
+    if "suburb" not in area_columns or "id" in area_columns:
+        c.execute("DROP TABLE IF EXISTS area_stats")
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS area_stats (
             suburb TEXT PRIMARY KEY,
@@ -266,7 +277,7 @@ def run_scraper(max_pages=50):
                     break
 
                 page += 1
-                time.sleep(1) # Delay to bypass Cloudflare
+                time.sleep(1)
 
             except Exception as e:
                 print(f"Error scraping {suburb_name} page {page}: {e}")
@@ -286,7 +297,6 @@ def run_scraper(max_pages=50):
             )
         conn.commit()
 
-        # Re-evaluate database to find the true Top 5% for this suburb
         c.execute("SELECT rate_sqm FROM raw_listings WHERE suburb=?", (suburb_name,))
         db_rates = [row[0] for row in c.fetchall()]
         
