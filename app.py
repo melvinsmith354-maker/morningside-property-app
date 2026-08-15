@@ -13,7 +13,7 @@ st.set_page_config(page_title="Morningside Rate Hunter", page_icon="🏢", layou
 init_db()
 
 st.title("🏢 Morningside Apartment Market Dashboard")
-st.caption("Density Outlier Engine & Top 2% Value Tracker")
+st.caption("Density Outlier Engine & Top 5% Value Tracker")
 
 conn = sqlite3.connect(DB_NAME)
 
@@ -33,14 +33,14 @@ except Exception:
 if not stats_df.empty:
     sub_stats = stats_df.iloc[0]
 
-    st.subheader("📊 Market Summary: Morningside")
+    st.subheader("📊 Market Summary: Morningside Apartments")
     col1, col2, col3, col4, col5 = st.columns(5)
     
     col1.metric("Total Listings Scraped", f"{int(sub_stats['total_raw'])}")
     col2.metric("Total Valid Listings", f"{int(sub_stats['total_clean'])}")
     col3.metric("Minimum Valid Price / m²", f"R {sub_stats['real_min']:,.2f}")
     col4.metric("Median Price / m²", f"R {sub_stats['median_rate']:,.2f}")
-    col5.metric("Top 2% Bargain Ceiling", f"R {sub_stats['top_2_percentile']:,.2f}")
+    col5.metric("Top 5% Bargain Ceiling", f"R {sub_stats['top_5_percentile']:,.2f}")
 
     st.divider()
 
@@ -58,14 +58,14 @@ if not stats_df.empty:
         clean_df['true_percentile'] = (clean_df['rank_num'] / total_valid_count) * 100
         clean_df['pct_below_median'] = ((sub_stats['median_rate'] - clean_df['rate_sqm']) / sub_stats['median_rate']) * 100
 
-        # Exact Top 2% calculation (e.g. 2% of 497 = 10 properties)
-        top_2_limit = int(np.ceil(total_valid_count * 0.02))
-        top_2_df = clean_df.head(top_2_limit)
+        # Exact Top 5% calculation (e.g. 5% of 497 = 25 properties)
+        top_5_limit = int(np.ceil(total_valid_count * 0.05))
+        top_5_df = clean_df.head(top_5_limit)
 
-        st.subheader(f"🔥 Top 2% Lowest Valid Properties ({len(top_2_df)} Found out of {total_valid_count})")
+        st.subheader(f"🔥 Top 5% Lowest Valid Properties ({len(top_5_df)} Found out of {total_valid_count})")
         
-        if not top_2_df.empty:
-            for _, row in top_2_df.iterrows():
+        if not top_5_df.empty:
+            for _, row in top_5_df.iterrows():
                 st.markdown(f"### 📍 [{row['title']}]({row['url']})")
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Price", f"R {row['price']:,.0f}")
@@ -75,9 +75,9 @@ if not stats_df.empty:
                 c5.metric("% Below Median", f"{row['pct_below_median']:.1f}% OFF", delta=f"-{row['pct_below_median']:.1f}%")
                 st.divider()
         else:
-            st.info("No listings fell within the Top 2% threshold.")
+            st.info("No listings fell within the Top 5% threshold.")
 
-        with st.expander(f"👁️ View All {total_valid_count} Valid Morningside Properties"):
+        with st.expander(f"👁️ View All {total_valid_count} Valid Morningside Apartments"):
             display_df = clean_df[['rank_num', 'true_percentile', 'pct_below_median', 'title', 'price', 'sqm', 'rate_sqm', 'url']].copy()
             display_df['pct_below_median'] = display_df['pct_below_median'].map(lambda x: f"{x:.1f}%")
             st.dataframe(display_df, use_container_width=True)
