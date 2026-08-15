@@ -2,23 +2,36 @@ name: Property24 Scraper Cron
 
 on:
   schedule:
-    # Runs every 30 minutes automatically in the cloud
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *' # Runs every 6 hours (change if needed)
+  workflow_dispatch: # Allows you to trigger it manually from the Actions tab
 
 jobs:
-  scrape:
+  scrape-and-update:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-      - name: Install Dependencies
+
+      - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run Scraper Engine
+
+      - name: Run Scraper
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scraper.py
+
+      - name: Commit and Push Database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add properties.db
+          # If there are no changes, the commit command will fail but exit 0 prevents the action from crashing
+          git commit -m "Auto-update database and Telegram alerts" || exit 0
+          git push
