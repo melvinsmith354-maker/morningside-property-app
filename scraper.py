@@ -46,7 +46,7 @@ def init_db():
         )
     ''')
 
-    # 🛠️ AUTO-MIGRATION: Check if 'suburb' exists, if not, add it and assign old records to Morningside
+    # Auto-migration check
     c.execute("PRAGMA table_info(raw_listings)")
     columns = [col[1] for col in c.fetchall()]
     if "suburb" not in columns:
@@ -128,7 +128,7 @@ def mark_alert_as_sent(listing_id):
     conn.commit()
     conn.close()
 
-def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate_sqm, true_percentile, pct_below_median, url):
+def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
     if is_alert_already_sent(listing_id):
         print(f"⏩ Alert already sent for ID {listing_id}. Skipping.")
         return
@@ -146,10 +146,12 @@ def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate
     beds_txt = f"{int(beds)}" if beds is not None and float(beds).is_integer() else f"{beds}" if beds is not None else "N/A"
     baths_txt = f"{int(baths)}" if baths is not None and float(baths).is_integer() else f"{baths}" if baths is not None else "N/A"
 
+    # 📩 Updated Telegram Message Format
     message = (
         f"🔥 *Top {bracket_percentile}% apartment ({suburb})*\n\n"
+        f"📉 *Discount:* {pct_below_median:.1f}% below median R/m²\n"
         f"🏆 *Percentile Rank:* Top {true_percentile:.2f}%\n"
-        f"📉 *Discount:* {pct_below_median:.1f}% below median R/m²\n\n"
+        f"🔢 *Position Rank:* {rank_num}/{total_clean}\n\n"
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
         f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n"
@@ -304,7 +306,6 @@ def run_scraper(max_pages=50):
 
         clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
 
-        # 🛠️ THE FIX: Explicitly name the columns here so the order is guaranteed!
         c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
         all_db_items = []
         for row in c.fetchall():
@@ -343,6 +344,8 @@ def run_scraper(max_pages=50):
                 baths=item["bathrooms"],
                 rate_sqm=item["rate_sqm"],
                 true_percentile=true_percentile,
+                rank_num=rank_num,
+                total_clean=total_clean,
                 pct_below_median=pct_below_median,
                 url=item["url"]
             )
