@@ -8,14 +8,17 @@ from bs4 import BeautifulSoup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "properties.db")
 
-MORNINGSIDE_URL = "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"
+MORNINGSIDE_URL = "https://www.property24.com/for-sale/morningside/sandton/gauteng/4258"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
+    c.execute("DROP TABLE IF EXISTS raw_listings")
+    c.execute("DROP TABLE IF EXISTS area_stats")
+
     c.execute('''
-        CREATE TABLE IF NOT EXISTS raw_listings (
+        CREATE TABLE raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
             suburb TEXT,
@@ -28,21 +31,14 @@ def init_db():
     ''')
     
     c.execute('''
-        CREATE TABLE IF NOT EXISTS area_stats (
+        CREATE TABLE area_stats (
             suburb TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
             real_min REAL,
             real_max REAL,
             median_rate REAL,
-            top_5_percentile REAL
-        )
-    ''')
-
-    # Prevents duplicate Telegram alerts
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS sent_alerts (
-            listing_id TEXT PRIMARY KEY
+            top_2_percentile REAL
         )
     ''')
     conn.commit()
@@ -82,31 +78,12 @@ def clean_area_data(rates):
     real_max = max(clean_rates)
     median_rate = float(np.median(clean_rates))
     
-    # Top 5% Threshold Value
-    top_5_thresh = float(np.percentile(clean_rates, 5))
+    # Top 2% Threshold Value
+    top_2_thresh = float(np.percentile(clean_rates, 2))
 
-    return clean_rates, real_min, real_max, median_rate, top_5_thresh
+    return clean_rates, real_min, real_max, median_rate, top_2_thresh
 
-def is_alert_already_sent(listing_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM sent_alerts WHERE listing_id=?", (str(listing_id),))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
-
-def mark_alert_as_sent(listing_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_alerts (listing_id) VALUES (?)", (str(listing_id),))
-    conn.commit()
-    conn.close()
-
-def send_telegram_alert(listing_id, title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
-    if is_alert_already_sent(listing_id):
-        print(f"⏩ Alert already sent for listing {listing_id} ({title}). Skipping duplicate.")
-        return
-
+def send_telegram_alert(title, suburb, price, sqm, rate_sqm, true_percentile, rank_num, total_clean, pct_below_median, url):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -115,7 +92,7 @@ def send_telegram_alert(listing_id, title, suburb, price, sqm, rate_sqm, true_pe
         return
 
     message = (
-        f"🔥 *TOP 5% APARTMENT BARGAIN ALERT! (Morningside)*\n\n"
+        f"🔥 *TOP 2% BARGAIN ALERT! (Morningside)*\n\n"
         f"📍 *Title:* {title}\n"
         f"🏆 *Value Rank:* **Top {true_percentile:.1f}%** (#{rank_num} of {total_clean})\n"
         f"📉 *Discount:* **{pct_below_median:.1f}% below median**\n"
@@ -135,8 +112,7 @@ def send_telegram_alert(listing_id, title, suburb, price, sqm, rate_sqm, true_pe
     try:
         res = requests.post(api_url, json=payload, timeout=10)
         res.raise_for_status()
-        mark_alert_as_sent(listing_id)
-        print(f"✅ Alert sent & recorded for listing {listing_id}: {title}")
+        print(f"✅ Alert sent for: {title}")
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
@@ -152,11 +128,12 @@ def run_scraper():
     suburb_name = "Morningside"
     base_url = MORNINGSIDE_URL.rstrip('/')
     
-    print(f"\n--- Scraping ALL Pages for Morningside Apartments ---")
+    print(f"\n--- Scraping ALL Pages for Morningside ---")
 
     page = 1
     listings = []
 
+    # Dynamic loop: keeps going until no more property cards exist
     while True:
         page_url = base_url if page == 1 else f"{base_url}/p{page}"
         print(f"Scraping Page {page}...")
@@ -185,7 +162,7 @@ def run_scraper():
                 listing_id = listing_id_match.group(1) if listing_id_match else href
 
                 title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
-                title = title_tag.text.strip() if title_tag else "Apartment Listing"
+                title = title_tag.text.strip() if title_tag else "Property Listing"
 
                 price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
                 if not price_tag:
@@ -209,7 +186,7 @@ def run_scraper():
                 rate_sqm = price / sqm
 
                 listings.append({
-                    "id": str(listing_id),
+                    "id": listing_id,
                     "area": "Sandton",
                     "suburb": suburb_name,
                     "title": title,
@@ -241,29 +218,29 @@ def run_scraper():
     conn.commit()
 
     rates = [x["rate_sqm"] for x in listings]
-    clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(rates)
+    clean_rates, real_min, real_max, median_rate, top_2_thresh = clean_area_data(rates)
 
     valid_items = [x for x in listings if real_min <= x["rate_sqm"] <= real_max]
     valid_items.sort(key=lambda x: x["rate_sqm"])
     total_clean = len(valid_items)
 
     c.execute(
-        "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (suburb_name, raw_count, total_clean, real_min, real_max, median_rate, top_5_thresh)
+        "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_2_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (suburb_name, raw_count, total_clean, real_min, real_max, median_rate, top_2_thresh)
     )
     conn.commit()
 
-    # Exact Top 5% Slice Count
-    top_5_count = int(np.ceil(total_clean * 0.05))
+    # Exact Top 2% Slice Count
+    top_2_count = int(np.ceil(total_clean * 0.02))
 
-    # Send Telegram alerts for new items in exact Top 5% slice
-    for idx, item in enumerate(valid_items[:top_5_count]):
+    # Send Telegram alerts for exact Top 2% slice
+    for idx, item in enumerate(valid_items[:top_2_count]):
         rank_num = idx + 1
         true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
         pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
 
         send_telegram_alert(
-            item["id"], item["title"], suburb_name, item["price"], item["sqm"], 
+            item["title"], suburb_name, item["price"], item["sqm"], 
             item["rate_sqm"], true_percentile, rank_num, total_clean, pct_below_median, item["url"]
         )
 
