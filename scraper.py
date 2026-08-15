@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from html import escape
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from email.utils import parsedate_to_datetime
 
 import numpy as np
 import requests
@@ -25,6 +26,8 @@ PRESET_SEARCHES = [
 PHYSICAL_MIN_RATE = 6500
 PHYSICAL_MAX_RATE = 80000
 DEAL_PERCENT = 5
+MAX_PAGE_ATTEMPTS = 6
+PAGE_DELAY_SECONDS = (3.0, 6.0)
 
 
 def utc_now():
@@ -150,12 +153,13 @@ def init_db():
 
 def build_session():
     session = requests.Session()
+    # Retry broken connections here. HTTP status retries are handled by
+    # fetch_page(), where they can be logged and use Property24's Retry-After.
     retry = Retry(
         total=3,
         connect=3,
         read=3,
         backoff_factor=1.2,
-        status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
@@ -173,6 +177,48 @@ def build_session():
         }
     )
     return session
+
+
+def retry_after_seconds(response):
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def fetch_page(session, page_url, page, referer=None):
+    """Fetch one results page, patiently retrying temporary server throttles."""
+    transient_statuses = {429, 500, 502, 503, 504}
+    headers = {"Referer": referer} if referer else {}
+
+    for attempt in range(1, MAX_PAGE_ATTEMPTS + 1):
+        response = session.get(page_url, timeout=25, headers=headers)
+        if response.status_code not in transient_statuses:
+            return response
+
+        if attempt == MAX_PAGE_ATTEMPTS:
+            return response
+
+        server_delay = retry_after_seconds(response)
+        backoff = min(45.0, 4.0 * (2 ** (attempt - 1)))
+        delay = max(server_delay or 0.0, backoff) + random.uniform(0.5, 2.5)
+        print(
+            f"Property24 returned HTTP {response.status_code} on page {page}; "
+            f"retrying in {delay:.1f}s ({attempt}/{MAX_PAGE_ATTEMPTS})."
+        )
+        response.close()
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def normalise_url(href):
@@ -417,12 +463,13 @@ def scrape_all_pages(session, search_name, base_url):
     reported_total = None
     pages_scraped = 0
     page = 1
+    previous_page_url = "https://www.property24.com/"
 
     while True:
         page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
         print(f"Scraping {search_name} page {page}: {page_url}")
 
-        response = session.get(page_url, timeout=25)
+        response = fetch_page(session, page_url, page, referer=previous_page_url)
         if response.status_code in (404, 410):
             print(f"Reached the end at page {page} (HTTP {response.status_code}).")
             break
@@ -460,6 +507,7 @@ def scrape_all_pages(session, search_name, base_url):
             break
 
         pages_scraped += 1
+        previous_page_url = page_url
         print(f"Page {page}: {len(page_ids)} cards, {len(listings_by_id)} unique listings so far.")
 
         if reported_total is not None and len(listings_by_id) >= reported_total:
@@ -470,7 +518,7 @@ def scrape_all_pages(session, search_name, base_url):
         if page > 500:
             raise RuntimeError("Pagination exceeded 500 pages; stopped as a safety guard.")
 
-        time.sleep(random.uniform(0.45, 0.85))
+        time.sleep(random.uniform(*PAGE_DELAY_SECONDS))
 
     return list(listings_by_id.values()), reported_total, pages_scraped
 
