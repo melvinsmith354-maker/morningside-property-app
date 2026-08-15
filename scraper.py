@@ -20,7 +20,10 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # Table for raw scraped listings
+    # =========================================================
+    # RAW LISTINGS TABLE
+    # =========================================================
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
@@ -33,7 +36,42 @@ def init_db():
         )
     """)
 
-    # Table for area statistics
+    # Check existing schema
+    c.execute("PRAGMA table_info(raw_listings)")
+    raw_columns = [row[1] for row in c.fetchall()]
+
+    required_raw_columns = {
+        "id",
+        "area",
+        "title",
+        "price",
+        "sqm",
+        "rate_sqm",
+        "url"
+    }
+
+    # If old / incompatible schema exists, rebuild table
+    if not required_raw_columns.issubset(set(raw_columns)):
+        print("⚠️ Old raw_listings schema detected. Rebuilding table.")
+
+        c.execute("DROP TABLE IF EXISTS raw_listings")
+
+        c.execute("""
+            CREATE TABLE raw_listings (
+                id TEXT PRIMARY KEY,
+                area TEXT,
+                title TEXT,
+                price REAL,
+                sqm REAL,
+                rate_sqm REAL,
+                url TEXT
+            )
+        """)
+
+    # =========================================================
+    # AREA STATS TABLE
+    # =========================================================
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS area_stats (
             area TEXT PRIMARY KEY,
@@ -45,30 +83,35 @@ def init_db():
         )
     """)
 
-    # ---------------------------------------------------------
-    # DATABASE MIGRATION
-    # CREATE TABLE IF NOT EXISTS does NOT modify old tables.
-    # This checks the existing schema and adds missing columns.
-    # ---------------------------------------------------------
+    # Check existing schema
     c.execute("PRAGMA table_info(area_stats)")
-    area_stats_columns = [row[1] for row in c.fetchall()]
+    stats_columns = [row[1] for row in c.fetchall()]
 
-    if "total_raw" not in area_stats_columns:
-        c.execute("ALTER TABLE area_stats ADD COLUMN total_raw INTEGER")
+    required_stats_columns = {
+        "area",
+        "total_raw",
+        "total_clean",
+        "real_min",
+        "real_max",
+        "top_3_percentile"
+    }
 
-    if "total_clean" not in area_stats_columns:
-        c.execute("ALTER TABLE area_stats ADD COLUMN total_clean INTEGER")
+    # If old / incompatible schema exists, rebuild table
+    if not required_stats_columns.issubset(set(stats_columns)):
+        print("⚠️ Old area_stats schema detected. Rebuilding table.")
 
-    if "real_min" not in area_stats_columns:
-        c.execute("ALTER TABLE area_stats ADD COLUMN real_min REAL")
+        c.execute("DROP TABLE IF EXISTS area_stats")
 
-    if "real_max" not in area_stats_columns:
-        c.execute("ALTER TABLE area_stats ADD COLUMN real_max REAL")
-
-    if "top_3_percentile" not in area_stats_columns:
-        c.execute(
-            "ALTER TABLE area_stats ADD COLUMN top_3_percentile REAL"
-        )
+        c.execute("""
+            CREATE TABLE area_stats (
+                area TEXT PRIMARY KEY,
+                total_raw INTEGER,
+                total_clean INTEGER,
+                real_min REAL,
+                real_max REAL,
+                top_3_percentile REAL
+            )
+        """)
 
     conn.commit()
     conn.close()
@@ -88,43 +131,50 @@ def clean_area_data(rates):
     if not rates:
         return [], 0, 0, 0
 
-    if len(rates) < 5:
-        clean_rates = sorted(rates)
-
-        real_min = min(clean_rates)
-        real_max = max(clean_rates)
-
-        # Cheapest 3% threshold
-        top_3_thresh = float(np.percentile(clean_rates, 3))
-
-        return clean_rates, real_min, real_max, top_3_thresh
-
     rates = sorted(rates)
 
-    # ---------------------------------------------------------
+    # If very few observations, do not run density-gap removal
+    if len(rates) < 5:
+        real_min = float(min(rates))
+        real_max = float(max(rates))
+
+        top_3_thresh = float(
+            np.percentile(rates, 3)
+        )
+
+        return (
+            rates,
+            real_min,
+            real_max,
+            top_3_thresh
+        )
+
+    # =========================================================
     # PASS 1: PHYSICAL REALITY FILTER
-    # ---------------------------------------------------------
+    # =========================================================
+
     filtered = [
         r for r in rates
         if 6500 <= r <= 80000
     ]
 
-    # If everything gets filtered, fall back to original data
+    # If physical filter removes everything,
+    # fall back to original dataset
     if not filtered:
         filtered = rates.copy()
 
-    # If only one value remains, np.diff is empty
     if len(filtered) == 1:
         return (
             filtered,
-            filtered[0],
-            filtered[0],
-            filtered[0]
+            float(filtered[0]),
+            float(filtered[0]),
+            float(filtered[0])
         )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # PASS 2: DENSITY GAP DETECTION
-    # ---------------------------------------------------------
+    # =========================================================
+
     diffs = np.diff(filtered)
 
     median_diff = (
@@ -133,10 +183,11 @@ def clean_area_data(rates):
         else 1.0
     )
 
-    # Protect against a zero median difference
+    # Protect against median difference being zero
     if median_diff <= 0:
         positive_diffs = [
-            d for d in diffs
+            float(d)
+            for d in diffs
             if d > 0
         ]
 
@@ -146,12 +197,14 @@ def clean_area_data(rates):
             else 1.0
         )
 
-    # ---------------------------------------------------------
-    # LOW END CUTOFF
-    # ---------------------------------------------------------
+    # =========================================================
+    # LOW-END ISOLATION
+    # =========================================================
+
     low_idx = 0
 
     for i in range(min(5, len(diffs))):
+
         gap_threshold = max(
             1500,
             median_diff * 4
@@ -160,19 +213,18 @@ def clean_area_data(rates):
         if diffs[i] > gap_threshold:
             low_idx = i + 1
 
-    # ---------------------------------------------------------
-    # HIGH END CUTOFF
-    # ---------------------------------------------------------
+    # =========================================================
+    # HIGH-END ISOLATION
+    # =========================================================
+
     high_idx = len(filtered)
 
-    start_index = len(diffs) - 1
-    stop_index = max(len(diffs) - 5, -1)
-
     for i in range(
-        start_index,
-        stop_index,
+        len(diffs) - 1,
+        max(len(diffs) - 6, -1),
         -1
     ):
+
         gap_threshold = max(
             3000,
             median_diff * 4
@@ -189,15 +241,21 @@ def clean_area_data(rates):
     if not clean_rates:
         clean_rates = filtered
 
-    real_min = float(min(clean_rates))
-    real_max = float(max(clean_rates))
+    real_min = float(
+        min(clean_rates)
+    )
 
-    # ---------------------------------------------------------
+    real_max = float(
+        max(clean_rates)
+    )
+
+    # =========================================================
     # TOP 3% BARGAIN THRESHOLD
     #
-    # Because lower R/m² = cheaper/better,
-    # we want the 3rd percentile, NOT the 97th.
-    # ---------------------------------------------------------
+    # Lower R/m² = better value.
+    # Therefore the 3rd percentile is correct.
+    # =========================================================
+
     top_3_thresh = float(
         np.percentile(
             clean_rates,
@@ -224,6 +282,7 @@ def send_telegram_alert(
     total_clean,
     url
 ):
+
     token = os.getenv(
         "TELEGRAM_TOKEN"
     )
@@ -233,17 +292,14 @@ def send_telegram_alert(
     )
 
     if not token or not chat_id:
-        print(
-            "⚠️ Missing Telegram credentials."
-        )
+        print("⚠️ Missing Telegram credentials.")
         return
 
     message = (
         f"🔥 *TOP 3% BARGAIN ALERT!*\n\n"
         f"📍 *Title:* {title}\n"
         f"🏷️ *Area:* {area}\n"
-        f"🏆 *Value Rank:* "
-        f"Top {true_percentile:.1f}% "
+        f"🏆 *Value Rank:* Top {true_percentile:.1f}% "
         f"(#{rank_num} of {total_clean} in area)\n"
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
@@ -300,6 +356,7 @@ def run_scraper():
     }
 
     try:
+
         for search in PRESET_SEARCHES:
 
             search_name = search["name"]
@@ -321,6 +378,10 @@ def run_scraper():
 
             area_listings = []
 
+            # =================================================
+            # SCRAPE ALL PAGES
+            # =================================================
+
             while page <= max_pages:
 
                 page_url = (
@@ -334,6 +395,7 @@ def run_scraper():
                 )
 
                 try:
+
                     res = requests.get(
                         page_url,
                         headers=headers,
@@ -342,9 +404,8 @@ def run_scraper():
 
                     if res.status_code != 200:
                         print(
-                            f"Stopping. HTTP "
-                            f"{res.status_code} "
-                            f"on page {page}."
+                            f"Stopping pagination. "
+                            f"HTTP {res.status_code}."
                         )
                         break
 
@@ -362,16 +423,16 @@ def run_scraper():
 
                     if not tiles:
                         print(
-                            "No listing tiles found. "
-                            "Stopping pagination."
+                            "No listing tiles found."
                         )
                         break
 
                     for tile in tiles:
 
-                        # -----------------------------
-                        # URL / LISTING ID
-                        # -----------------------------
+                        # =====================================
+                        # LISTING URL
+                        # =====================================
+
                         link_tag = tile.find(
                             "a",
                             href=True
@@ -389,6 +450,10 @@ def run_scraper():
                             f"https://www.property24.com{href}"
                         )
 
+                        # =====================================
+                        # LISTING ID
+                        # =====================================
+
                         listing_id_match = re.search(
                             r"/(\d+)(?:[/?#]|$)",
                             href
@@ -400,9 +465,10 @@ def run_scraper():
                             else full_url
                         )
 
-                        # -----------------------------
+                        # =====================================
                         # TITLE
-                        # -----------------------------
+                        # =====================================
+
                         title_tag = (
                             tile.find(
                                 "span",
@@ -424,9 +490,10 @@ def run_scraper():
                             else "Property Listing"
                         )
 
-                        # -----------------------------
+                        # =====================================
                         # PRICE
-                        # -----------------------------
+                        # =====================================
+
                         price_tag = (
                             tile.find(
                                 "div",
@@ -455,9 +522,13 @@ def run_scraper():
                             price_digits
                         )
 
-                        # -----------------------------
-                        # FLOOR SIZE
-                        # -----------------------------
+                        # =====================================
+                        # SIZE
+                        # Prefer floor size for apartments
+                        # =====================================
+
+                        sqm = None
+
                         sqm_tag = (
                             tile.find(
                                 "span",
@@ -475,9 +546,8 @@ def run_scraper():
                             )
                         )
 
-                        sqm = None
-
                         if sqm_tag:
+
                             sqm_digits = re.sub(
                                 r"[^\d.]",
                                 "",
@@ -485,14 +555,18 @@ def run_scraper():
                             )
 
                             if sqm_digits:
+
                                 try:
                                     sqm = float(
                                         sqm_digits
                                     )
+
                                 except ValueError:
                                     sqm = None
 
+                        # Fallback search inside tile text
                         if sqm is None:
+
                             tile_text = tile.get_text(
                                 " ",
                                 strip=True
@@ -505,6 +579,7 @@ def run_scraper():
                             )
 
                             if sqm_match:
+
                                 sqm_text = (
                                     sqm_match
                                     .group(1)
@@ -515,15 +590,17 @@ def run_scraper():
                                     sqm = float(
                                         sqm_text
                                     )
+
                                 except ValueError:
                                     sqm = None
 
                         if not sqm or sqm <= 0:
                             continue
 
-                        # -----------------------------
-                        # RATE PER M²
-                        # -----------------------------
+                        # =====================================
+                        # RATE / M²
+                        # =====================================
+
                         rate_sqm = (
                             price / sqm
                         )
@@ -543,22 +620,27 @@ def run_scraper():
                     page += 1
 
                 except Exception as e:
+
                     print(
                         f"Error scraping "
                         f"{page_url}: {e}"
                     )
+
                     break
 
             if not area_listings:
+
                 print(
                     f"No usable listings found "
                     f"for {search_name}."
                 )
+
                 continue
 
-            # -------------------------------------------------
+            # =================================================
             # REMOVE DUPLICATES FROM CURRENT SCRAPE
-            # -------------------------------------------------
+            # =================================================
+
             unique_listings = {}
 
             for item in area_listings:
@@ -570,10 +652,27 @@ def run_scraper():
                 unique_listings.values()
             )
 
-            # -------------------------------------------------
-            # SAVE RAW LISTINGS
-            # -------------------------------------------------
+            # =================================================
+            # CLEAR OLD AREA LISTINGS
+            #
+            # Prevent old expired listings from remaining
+            # inside the current market dataset.
+            # =================================================
+
+            c.execute(
+                """
+                DELETE FROM raw_listings
+                WHERE area = ?
+                """,
+                (search_name,)
+            )
+
+            # =================================================
+            # SAVE CURRENT RAW LISTINGS
+            # =================================================
+
             for item in area_listings:
+
                 c.execute(
                     """
                     INSERT OR REPLACE INTO raw_listings
@@ -601,9 +700,10 @@ def run_scraper():
 
             conn.commit()
 
-            # -------------------------------------------------
-            # DENSITY CLEANING
-            # -------------------------------------------------
+            # =================================================
+            # DENSITY ENGINE
+            # =================================================
+
             rates = [
                 x["rate_sqm"]
                 for x in area_listings
@@ -618,9 +718,10 @@ def run_scraper():
                 rates
             )
 
-            # -------------------------------------------------
-            # CREATE CLEAN ITEM SET
-            # -------------------------------------------------
+            # =================================================
+            # CLEAN LISTINGS
+            # =================================================
+
             clean_area_items = [
                 x
                 for x in area_listings
@@ -641,12 +742,10 @@ def run_scraper():
                 clean_area_items
             )
 
-            # -------------------------------------------------
-            # SAVE AREA STATS
-            #
-            # Use UPSERT rather than INSERT OR REPLACE.
-            # This is safer and clearer.
-            # -------------------------------------------------
+            # =================================================
+            # SAVE AREA STATISTICS
+            # =================================================
+
             c.execute(
                 """
                 INSERT INTO area_stats
@@ -662,10 +761,19 @@ def run_scraper():
 
                 ON CONFLICT(area)
                 DO UPDATE SET
-                    total_raw = excluded.total_raw,
-                    total_clean = excluded.total_clean,
-                    real_min = excluded.real_min,
-                    real_max = excluded.real_max,
+
+                    total_raw =
+                        excluded.total_raw,
+
+                    total_clean =
+                        excluded.total_clean,
+
+                    real_min =
+                        excluded.real_min,
+
+                    real_max =
+                        excluded.real_max,
+
                     top_3_percentile =
                         excluded.top_3_percentile
                 """,
@@ -685,15 +793,16 @@ def run_scraper():
                 f"{search_name}: "
                 f"{len(area_listings)} raw | "
                 f"{total_clean} clean | "
-                f"R{real_min:,.2f} - "
-                f"R{real_max:,.2f}/m² | "
+                f"R {real_min:,.2f} - "
+                f"R {real_max:,.2f}/m² | "
                 f"Top 3% ceiling "
-                f"R{top_3_thresh:,.2f}/m²"
+                f"R {top_3_thresh:,.2f}/m²"
             )
 
-            # -------------------------------------------------
-            # TELEGRAM ALERTS
-            # -------------------------------------------------
+            # =================================================
+            # SEND TELEGRAM ALERTS
+            # =================================================
+
             for idx, item in enumerate(
                 clean_area_items
             ):
@@ -702,9 +811,10 @@ def run_scraper():
 
                 true_percentile = (
                     (
-                        rank_num /
-                        total_clean
-                    ) * 100
+                        rank_num
+                        / total_clean
+                    )
+                    * 100
                     if total_clean > 0
                     else 100.0
                 )
@@ -713,6 +823,7 @@ def run_scraper():
                     item["rate_sqm"]
                     <= top_3_thresh
                 ):
+
                     send_telegram_alert(
                         item["title"],
                         search_name,
