@@ -15,11 +15,10 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    c.execute("DROP TABLE IF EXISTS raw_listings")
-    c.execute("DROP TABLE IF EXISTS area_stats")
-
+    # 🛑 NO "DROP TABLE" COMMANDS HERE - Your data will now survive cloud runs!
+    
     c.execute('''
-        CREATE TABLE raw_listings (
+        CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
             title TEXT,
             price REAL,
@@ -32,7 +31,7 @@ def init_db():
     ''')
     
     c.execute('''
-        CREATE TABLE area_stats (
+        CREATE TABLE IF NOT EXISTS area_stats (
             id INTEGER PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
@@ -116,9 +115,9 @@ def send_telegram_alert(listing_id, price, sqm, beds, baths, rate_sqm, true_perc
     bracket_percentile = int(np.ceil(true_percentile))
     bracket_percentile = max(1, bracket_percentile) 
 
-    # Clean formatting for beds and baths
-    beds_txt = f"{int(beds)}" if beds and beds.is_integer() else f"{beds}" if beds else "N/A"
-    baths_txt = f"{int(baths)}" if baths and baths.is_integer() else f"{baths}" if baths else "N/A"
+    # Clean formatting for beds and baths (e.g., "2" instead of "2.0")
+    beds_txt = f"{int(beds)}" if beds is not None and float(beds).is_integer() else f"{beds}" if beds is not None else "N/A"
+    baths_txt = f"{int(baths)}" if baths is not None and float(baths).is_integer() else f"{baths}" if baths is not None else "N/A"
 
     message = (
         f"🔥 *Top {bracket_percentile}% apartment*\n\n"
@@ -152,15 +151,18 @@ def run_scraper(max_pages=50):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
+    # Cloudflare evasion headers
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     }
     
     print(f"\n--- Scraping Morningside Apartments ---")
 
     page = 1
     listings = []
-    seen_ids = set() # Tracks duplicates
+    seen_ids = set()
 
     while page <= max_pages:
         page_url = MORNINGSIDE_URL if page == 1 else f"{MORNINGSIDE_URL}/p{page}"
@@ -191,7 +193,6 @@ def run_scraper(max_pages=50):
                 listing_id_match = re.search(r'/(\d+)$', href)
                 listing_id = listing_id_match.group(1) if listing_id_match else href
                 
-                # Prevent duplication
                 if listing_id in seen_ids:
                     continue
                 seen_ids.add(listing_id)
@@ -239,20 +240,19 @@ def run_scraper(max_pages=50):
                     "url": full_url
                 })
 
-            # Detect pagination loop limit
             if new_on_page == 0:
                 print(f"Zero new properties found on page {page}. End of unique listings reached.")
                 break
 
             page += 1
-            time.sleep(0.5)
+            time.sleep(1) # Slightly longer delay to bypass Cloudflare in GitHub Actions
 
         except Exception as e:
             print(f"Error scraping page {page}: {e}")
             break
 
     if not listings:
-        print("No valid listings scraped.")
+        print("No new valid listings scraped.")
         conn.close()
         return
 
@@ -266,16 +266,27 @@ def run_scraper(max_pages=50):
         )
     conn.commit()
 
-    rates = [x["rate_sqm"] for x in listings]
-    clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(rates)
+    # Re-evaluate entire database to find the true Top 5% of all time
+    c.execute("SELECT rate_sqm FROM raw_listings")
+    db_rates = [row[0] for row in c.fetchall()]
+    
+    clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
 
-    valid_items = [x for x in listings if real_min <= x["rate_sqm"] <= real_max]
+    c.execute("SELECT * FROM raw_listings")
+    all_db_items = []
+    for row in c.fetchall():
+        all_db_items.append({
+            "id": row[0], "title": row[1], "price": row[2], "sqm": row[3], 
+            "bedrooms": row[4], "bathrooms": row[5], "rate_sqm": row[6], "url": row[7]
+        })
+
+    valid_items = [x for x in all_db_items if real_min <= x["rate_sqm"] <= real_max]
     valid_items.sort(key=lambda x: x["rate_sqm"])
     total_clean = len(valid_items)
 
     c.execute(
-        "INSERT INTO area_stats (total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?)",
-        (raw_count, total_clean, real_min, real_max, median_rate, top_5_thresh)
+        "INSERT OR REPLACE INTO area_stats (id, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (1, ?, ?, ?, ?, ?, ?)",
+        (len(all_db_items), total_clean, real_min, real_max, median_rate, top_5_thresh)
     )
     conn.commit()
 
