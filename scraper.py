@@ -15,11 +15,9 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     
-    # 🧹 Reset tables for a clean slate
     c.execute("DROP TABLE IF EXISTS raw_listings")
     c.execute("DROP TABLE IF EXISTS area_stats")
 
-    # Table for all scraped property details
     c.execute('''
         CREATE TABLE raw_listings (
             id TEXT PRIMARY KEY,
@@ -33,7 +31,6 @@ def init_db():
         )
     ''')
     
-    # Table for area metrics
     c.execute('''
         CREATE TABLE area_stats (
             id INTEGER PRIMARY KEY,
@@ -46,7 +43,6 @@ def init_db():
         )
     ''')
 
-    # Table to track Telegram alerts (prevents duplicates)
     c.execute('''
         CREATE TABLE IF NOT EXISTS sent_alerts (
             listing_id TEXT PRIMARY KEY
@@ -61,12 +57,10 @@ def clean_area_data(rates):
 
     rates = sorted(rates)
     
-    # Pass 1: Physical Reality Filter (R6,500/m² to R80,000/m²)
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
 
-    # Pass 2: Density / Isolation Gap Detection
     diffs = np.diff(filtered)
     median_diff = np.median(diffs) if len(diffs) > 0 else 1.0
 
@@ -88,8 +82,6 @@ def clean_area_data(rates):
     real_min = min(clean_rates)
     real_max = max(clean_rates)
     median_rate = float(np.median(clean_rates))
-    
-    # Top 5% Threshold (Lowest 5% of valid rates)
     top_5_thresh = float(np.percentile(clean_rates, 5))
 
     return clean_rates, real_min, real_max, median_rate, top_5_thresh
@@ -121,9 +113,12 @@ def send_telegram_alert(listing_id, price, sqm, beds, baths, rate_sqm, true_perc
         print("⚠️ Missing Telegram credentials. Cannot send alert.")
         return
 
-    # Calculate dynamic bracket for the title (e.g., 1.24% becomes Top 2%)
     bracket_percentile = int(np.ceil(true_percentile))
-    bracket_percentile = max(1, bracket_percentile) # Ensure it never says Top 0%
+    bracket_percentile = max(1, bracket_percentile) 
+
+    # Clean formatting for beds and baths
+    beds_txt = f"{int(beds)}" if beds and beds.is_integer() else f"{beds}" if beds else "N/A"
+    baths_txt = f"{int(baths)}" if baths and baths.is_integer() else f"{baths}" if baths else "N/A"
 
     message = (
         f"🔥 *Top {bracket_percentile}% apartment*\n\n"
@@ -132,8 +127,8 @@ def send_telegram_alert(listing_id, price, sqm, beds, baths, rate_sqm, true_perc
         f"💰 *Price:* R {price:,.0f}\n"
         f"📐 *Size:* {sqm:.0f} m²\n"
         f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n"
-        f"🛏️ *Bedrooms:* {int(beds) if beds else 'N/A'}\n"
-        f"🛁 *Bathrooms:* {float(baths) if baths else 'N/A'}\n\n"
+        f"🛏️ *Bedrooms:* {beds_txt}\n"
+        f"🛁 *Bathrooms:* {baths_txt}\n\n"
         f"🔗 [View Listing]({url})"
     )
     
@@ -165,6 +160,7 @@ def run_scraper(max_pages=50):
 
     page = 1
     listings = []
+    seen_ids = set() # Tracks duplicates
 
     while page <= max_pages:
         page_url = MORNINGSIDE_URL if page == 1 else f"{MORNINGSIDE_URL}/p{page}"
@@ -183,6 +179,8 @@ def run_scraper(max_pages=50):
                 print(f"No property tiles found on page {page}. Scraping complete.")
                 break
 
+            new_on_page = 0
+
             for tile in tiles:
                 link_tag = tile.find("a", href=True)
                 if not link_tag:
@@ -192,6 +190,12 @@ def run_scraper(max_pages=50):
                 
                 listing_id_match = re.search(r'/(\d+)$', href)
                 listing_id = listing_id_match.group(1) if listing_id_match else href
+                
+                # Prevent duplication
+                if listing_id in seen_ids:
+                    continue
+                seen_ids.add(listing_id)
+                new_on_page += 1
 
                 title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
                 title = title_tag.text.strip() if title_tag else "Apartment"
@@ -204,7 +208,6 @@ def run_scraper(max_pages=50):
                     continue
                 price = float(price_digits)
 
-                # Extract Size
                 sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
                 sqm = None
                 if not sqm_tag:
@@ -217,11 +220,9 @@ def run_scraper(max_pages=50):
                 if not sqm or sqm <= 0:
                     continue
                 
-                # Extract Bedrooms
                 bed_tag = tile.find("span", title="Bedrooms")
                 beds = float(re.sub(r'[^\d\.]', '', bed_tag.text)) if bed_tag and re.search(r'\d', bed_tag.text) else None
                 
-                # Extract Bathrooms
                 bath_tag = tile.find("span", title="Bathrooms")
                 baths = float(re.sub(r'[^\d\.]', '', bath_tag.text)) if bath_tag and re.search(r'\d', bath_tag.text) else None
 
@@ -238,8 +239,13 @@ def run_scraper(max_pages=50):
                     "url": full_url
                 })
 
+            # Detect pagination loop limit
+            if new_on_page == 0:
+                print(f"Zero new properties found on page {page}. End of unique listings reached.")
+                break
+
             page += 1
-            time.sleep(0.5)  # 500ms delay to prevent Property24 timeouts
+            time.sleep(0.5)
 
         except Exception as e:
             print(f"Error scraping page {page}: {e}")
@@ -251,7 +257,7 @@ def run_scraper(max_pages=50):
         return
 
     raw_count = len(listings)
-    print(f"Scraped {raw_count} total raw listings.")
+    print(f"Scraped {raw_count} total unique raw listings.")
 
     for item in listings:
         c.execute(
@@ -273,10 +279,8 @@ def run_scraper(max_pages=50):
     )
     conn.commit()
 
-    # Calculate True Top 5% Limit
     top_5_count = int(np.ceil(total_clean * 0.05))
 
-    # Evaluate new Top 5% deals and send alerts
     for idx, item in enumerate(valid_items[:top_5_count]):
         rank_num = idx + 1
         true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
