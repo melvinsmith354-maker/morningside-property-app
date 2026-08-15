@@ -14,7 +14,10 @@ st.set_page_config(
     layout="wide"
 )
 
-# Make sure DB and schema exist before querying
+# =========================================================
+# INITIALISE DATABASE
+# =========================================================
+
 init_db()
 
 st.title(
@@ -25,18 +28,22 @@ st.caption(
     "2-Pass Density Isolation & Outlier Removal Engine"
 )
 
-# ---------------------------------------------------------
-# RUN SCRAPER
-# ---------------------------------------------------------
+# =========================================================
+# RUN SCRAPER BUTTON
+# =========================================================
+
 if st.button(
     "🚀 Run Scraper & Market Engine",
     type="primary"
 ):
+
     try:
+
         with st.spinner(
             "Scraping all pages and "
             "processing market density..."
         ):
+
             run_scraper()
 
         st.success(
@@ -46,18 +53,23 @@ if st.button(
         st.rerun()
 
     except Exception as e:
+
         st.error(
-            f"Scraper failed: {e}"
+            "Scraper failed."
         )
 
         st.exception(e)
 
 st.divider()
 
-# ---------------------------------------------------------
+# =========================================================
 # LOAD AREA STATISTICS
-# ---------------------------------------------------------
+# =========================================================
+
+stats_df = pd.DataFrame()
+
 try:
+
     with sqlite3.connect(
         DB_NAME
     ) as conn:
@@ -71,25 +83,29 @@ try:
                 real_min,
                 real_max,
                 top_3_percentile
+
             FROM area_stats
+
             WHERE area = ?
             """,
             conn,
-            params=("Morningside",)
+            params=(
+                "Morningside",
+            )
         )
 
 except Exception as e:
+
     st.error(
         "Could not read area statistics."
     )
 
     st.exception(e)
 
-    stats_df = pd.DataFrame()
+# =========================================================
+# DISPLAY STATISTICS
+# =========================================================
 
-# ---------------------------------------------------------
-# DISPLAY RESULTS
-# ---------------------------------------------------------
 if not stats_df.empty:
 
     stats = stats_df.iloc[0]
@@ -115,7 +131,8 @@ if not stats_df.empty:
     col3.metric(
         "Real Market Minimum",
         (
-            f"R {stats['real_min']:,.2f}"
+            f"R "
+            f"{stats['real_min']:,.2f}"
             f" / m²"
         )
     )
@@ -123,7 +140,8 @@ if not stats_df.empty:
     col4.metric(
         "Real Market Maximum",
         (
-            f"R {stats['real_max']:,.2f}"
+            f"R "
+            f"{stats['real_max']:,.2f}"
             f" / m²"
         )
     )
@@ -139,10 +157,14 @@ if not stats_df.empty:
 
     st.divider()
 
-    # -----------------------------------------------------
-    # LOAD RAW LISTINGS
-    # -----------------------------------------------------
+    # =====================================================
+    # LOAD PROPERTY LISTINGS
+    # =====================================================
+
+    raw_df = pd.DataFrame()
+
     try:
+
         with sqlite3.connect(
             DB_NAME
         ) as conn:
@@ -157,27 +179,31 @@ if not stats_df.empty:
                     sqm,
                     rate_sqm,
                     url
+
                 FROM raw_listings
+
                 WHERE area = ?
                 """,
                 conn,
-                params=("Morningside",)
+                params=(
+                    "Morningside",
+                )
             )
 
     except Exception as e:
+
         st.error(
             "Could not read property listings."
         )
 
         st.exception(e)
 
-        raw_df = pd.DataFrame()
+    # =====================================================
+    # PREPARE CLEAN MARKET DATA
+    # =====================================================
 
     if not raw_df.empty:
 
-        # -------------------------------------------------
-        # REMOVE DATA THAT CANNOT BE RANKED
-        # -------------------------------------------------
         raw_df = raw_df.dropna(
             subset=[
                 "price",
@@ -190,9 +216,6 @@ if not stats_df.empty:
             raw_df["sqm"] > 0
         ].copy()
 
-        # -------------------------------------------------
-        # APPLY CURRENT MARKET BOUNDS
-        # -------------------------------------------------
         clean_df = raw_df[
             (
                 raw_df["rate_sqm"]
@@ -211,20 +234,26 @@ if not stats_df.empty:
                 by="rate_sqm",
                 ascending=True
             )
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
         total_clean_count = len(
             clean_df
         )
 
+        # =================================================
+        # RANKING
+        # =================================================
+
         if total_clean_count > 0:
 
-            # ---------------------------------------------
-            # ORDINAL RANK
-            # ---------------------------------------------
-            clean_df["rank_num"] = (
-                clean_df.index + 1
+            clean_df[
+                "rank_num"
+            ] = (
+                clean_df.index
+                + 1
             )
 
             clean_df[
@@ -235,9 +264,10 @@ if not stats_df.empty:
                 * 100
             )
 
-            # ---------------------------------------------
-            # TOP 3% BARGAINS
-            # ---------------------------------------------
+            # =============================================
+            # TOP 3% DEALS
+            # =============================================
+
             top_3_df = clean_df[
                 clean_df["rate_sqm"]
                 <= stats[
@@ -268,12 +298,18 @@ if not stats_df.empty:
 
                     c1.metric(
                         "Price",
-                        f"R {row['price']:,.0f}"
+                        (
+                            f"R "
+                            f"{row['price']:,.0f}"
+                        )
                     )
 
                     c2.metric(
                         "Size",
-                        f"{row['sqm']:.0f} m²"
+                        (
+                            f"{row['sqm']:.0f}"
+                            f" m²"
+                        )
                     )
 
                     c3.metric(
@@ -297,18 +333,19 @@ if not stats_df.empty:
                     st.divider()
 
             else:
+
                 st.info(
                     "No listings fell within "
                     "the Top 3% threshold."
                 )
 
-            # ---------------------------------------------
-            # CLEAN MARKET TABLE
-            # ---------------------------------------------
+            # =============================================
+            # ALL CLEAN PROPERTIES TABLE
+            # =============================================
+
             with st.expander(
-                "👁️ View All Valid "
-                "Morningside Properties "
-                "(Cleaned)"
+                "👁️ View All Valid Morningside "
+                "Properties (Cleaned)"
             ):
 
                 display_df = clean_df[
@@ -328,20 +365,50 @@ if not stats_df.empty:
                         columns={
                             "rank_num":
                                 "Rank",
+
                             "true_percentile":
                                 "Percentile %",
+
                             "title":
                                 "Property",
+
                             "price":
                                 "Price",
+
                             "sqm":
                                 "Size m²",
+
                             "rate_sqm":
                                 "Rate / m²",
+
                             "url":
                                 "URL"
                         }
                     )
+                )
+
+                display_df[
+                    "Percentile %"
+                ] = (
+                    display_df[
+                        "Percentile %"
+                    ].round(2)
+                )
+
+                display_df[
+                    "Price"
+                ] = (
+                    display_df[
+                        "Price"
+                    ].round(0)
+                )
+
+                display_df[
+                    "Rate / m²"
+                ] = (
+                    display_df[
+                        "Rate / m²"
+                    ].round(2)
                 )
 
                 st.dataframe(
@@ -351,19 +418,22 @@ if not stats_df.empty:
                 )
 
         else:
+
             st.warning(
-                "Listings exist, but none "
-                "fall inside the current "
-                "clean market range."
+                "Listings were scraped, "
+                "but none fall inside the "
+                "current clean market range."
             )
 
     else:
+
         st.info(
-            "No Morningside listings are "
-            "currently stored in the database."
+            "No Morningside property listings "
+            "are currently stored in the database."
         )
 
 else:
+
     st.info(
         "👋 Welcome! Click the "
         "**🚀 Run Scraper & Market Engine** "
