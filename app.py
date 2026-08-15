@@ -1,81 +1,371 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-from scraper import init_db, run_scraper
 
-st.set_page_config(page_title="P24 Rate Hunter", page_icon="🏡", layout="wide")
+from scraper import (
+    DB_NAME,
+    init_db,
+    run_scraper
+)
 
+st.set_page_config(
+    page_title="P24 Rate Hunter",
+    page_icon="🏡",
+    layout="wide"
+)
+
+# Make sure DB and schema exist before querying
 init_db()
 
-st.title("🏡 Property24 Rate-per-m² Market Dashboard")
-st.caption("2-Pass Density Isolation & Outlier Removal Engine")
+st.title(
+    "🏡 Property24 Rate-per-m² Market Dashboard"
+)
 
-conn = sqlite3.connect("properties.db")
+st.caption(
+    "2-Pass Density Isolation & Outlier Removal Engine"
+)
 
-# Run Scraper Button
-if st.button("🚀 Run Scraper & Market Engine", type="primary"):
-    with st.spinner("Scraping all pages and processing market density..."):
-        run_scraper()
-    st.success("Analysis complete!")
-    st.rerun()
+# ---------------------------------------------------------
+# RUN SCRAPER
+# ---------------------------------------------------------
+if st.button(
+    "🚀 Run Scraper & Market Engine",
+    type="primary"
+):
+    try:
+        with st.spinner(
+            "Scraping all pages and "
+            "processing market density..."
+        ):
+            run_scraper()
+
+        st.success(
+            "Analysis complete!"
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        st.error(
+            f"Scraper failed: {e}"
+        )
+
+        st.exception(e)
 
 st.divider()
 
+# ---------------------------------------------------------
+# LOAD AREA STATISTICS
+# ---------------------------------------------------------
 try:
-    stats_df = pd.read_sql_query("SELECT * FROM area_stats WHERE area='Morningside'", conn)
-except Exception:
+    with sqlite3.connect(
+        DB_NAME
+    ) as conn:
+
+        stats_df = pd.read_sql_query(
+            """
+            SELECT
+                area,
+                total_raw,
+                total_clean,
+                real_min,
+                real_max,
+                top_3_percentile
+            FROM area_stats
+            WHERE area = ?
+            """,
+            conn,
+            params=("Morningside",)
+        )
+
+except Exception as e:
+    st.error(
+        "Could not read area statistics."
+    )
+
+    st.exception(e)
+
     stats_df = pd.DataFrame()
 
+# ---------------------------------------------------------
+# DISPLAY RESULTS
+# ---------------------------------------------------------
 if not stats_df.empty:
+
     stats = stats_df.iloc[0]
-    
-    st.subheader("📊 Market Density & Outlier Summary")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    col1.metric("Raw Scraped Listings", f"{int(stats['total_raw'])}")
-    col2.metric("Valid (Non-Junk) Listings", f"{int(stats['total_clean'])}")
-    col3.metric("Real Market Minimum", f"R {stats['real_min']:,.2f} / m²")
-    col4.metric("Real Market Maximum", f"R {stats['real_max']:,.2f} / m²")
-    col5.metric("Top 3% Bargain Ceiling", f"R {stats['top_3_percentile']:,.2f} / m²")
+
+    st.subheader(
+        "📊 Market Density & Outlier Summary"
+    )
+
+    col1, col2, col3, col4, col5 = (
+        st.columns(5)
+    )
+
+    col1.metric(
+        "Raw Scraped Listings",
+        f"{int(stats['total_raw'])}"
+    )
+
+    col2.metric(
+        "Valid (Non-Junk) Listings",
+        f"{int(stats['total_clean'])}"
+    )
+
+    col3.metric(
+        "Real Market Minimum",
+        (
+            f"R {stats['real_min']:,.2f}"
+            f" / m²"
+        )
+    )
+
+    col4.metric(
+        "Real Market Maximum",
+        (
+            f"R {stats['real_max']:,.2f}"
+            f" / m²"
+        )
+    )
+
+    col5.metric(
+        "Top 3% Bargain Ceiling",
+        (
+            f"R "
+            f"{stats['top_3_percentile']:,.2f}"
+            f" / m²"
+        )
+    )
 
     st.divider()
 
+    # -----------------------------------------------------
+    # LOAD RAW LISTINGS
+    # -----------------------------------------------------
     try:
-        raw_df = pd.read_sql_query("SELECT * FROM raw_listings WHERE area='Morningside'", conn)
-    except Exception:
+        with sqlite3.connect(
+            DB_NAME
+        ) as conn:
+
+            raw_df = pd.read_sql_query(
+                """
+                SELECT
+                    id,
+                    area,
+                    title,
+                    price,
+                    sqm,
+                    rate_sqm,
+                    url
+                FROM raw_listings
+                WHERE area = ?
+                """,
+                conn,
+                params=("Morningside",)
+            )
+
+    except Exception as e:
+        st.error(
+            "Could not read property listings."
+        )
+
+        st.exception(e)
+
         raw_df = pd.DataFrame()
 
     if not raw_df.empty:
-        # Filter non-junk listings using real market min and max bounds
-        clean_df = raw_df[(raw_df['rate_sqm'] >= stats['real_min']) & (raw_df['rate_sqm'] <= stats['real_max'])].sort_values(by="rate_sqm").reset_index(drop=True)
-        
-        total_clean_count = len(clean_df)
-        
-        # Calculate True Ordinal Percentile Rank relative to ALL valid listings (e.g., out of 352)
-        clean_df['rank_num'] = clean_df.index + 1
-        clean_df['true_percentile'] = (clean_df['rank_num'] / total_clean_count) * 100
 
-        # Filter properties sitting inside the true Top 3% threshold
-        top_3_df = clean_df[clean_df['rate_sqm'] <= stats['top_3_percentile']]
+        # -------------------------------------------------
+        # REMOVE DATA THAT CANNOT BE RANKED
+        # -------------------------------------------------
+        raw_df = raw_df.dropna(
+            subset=[
+                "price",
+                "sqm",
+                "rate_sqm"
+            ]
+        ).copy()
 
-        st.subheader(f"🔥 Top 3% Bargain Deals ({len(top_3_df)} Found)")
-        
-        if not top_3_df.empty:
-            for _, row in top_3_df.iterrows():
-                st.markdown(f"### 📍 [{row['title']}]({row['url']})")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Price", f"R {row['price']:,.0f}")
-                c2.metric("Size", f"{row['sqm']:.0f} m²")
-                c3.metric("Rate / m²", f"R {row['rate_sqm']:,.2f}")
-                c4.metric("Value Rank", f"Top {row['true_percentile']:.1f}% (#{int(row['rank_num'])} of {total_clean_count})")
-                st.divider()
+        raw_df = raw_df[
+            raw_df["sqm"] > 0
+        ].copy()
+
+        # -------------------------------------------------
+        # APPLY CURRENT MARKET BOUNDS
+        # -------------------------------------------------
+        clean_df = raw_df[
+            (
+                raw_df["rate_sqm"]
+                >= stats["real_min"]
+            )
+            &
+            (
+                raw_df["rate_sqm"]
+                <= stats["real_max"]
+            )
+        ].copy()
+
+        clean_df = (
+            clean_df
+            .sort_values(
+                by="rate_sqm",
+                ascending=True
+            )
+            .reset_index(drop=True)
+        )
+
+        total_clean_count = len(
+            clean_df
+        )
+
+        if total_clean_count > 0:
+
+            # ---------------------------------------------
+            # ORDINAL RANK
+            # ---------------------------------------------
+            clean_df["rank_num"] = (
+                clean_df.index + 1
+            )
+
+            clean_df[
+                "true_percentile"
+            ] = (
+                clean_df["rank_num"]
+                / total_clean_count
+                * 100
+            )
+
+            # ---------------------------------------------
+            # TOP 3% BARGAINS
+            # ---------------------------------------------
+            top_3_df = clean_df[
+                clean_df["rate_sqm"]
+                <= stats[
+                    "top_3_percentile"
+                ]
+            ].copy()
+
+            st.subheader(
+                f"🔥 Top 3% Bargain Deals "
+                f"({len(top_3_df)} Found)"
+            )
+
+            if not top_3_df.empty:
+
+                for _, row in (
+                    top_3_df.iterrows()
+                ):
+
+                    st.markdown(
+                        f"### 📍 "
+                        f"[{row['title']}]"
+                        f"({row['url']})"
+                    )
+
+                    c1, c2, c3, c4 = (
+                        st.columns(4)
+                    )
+
+                    c1.metric(
+                        "Price",
+                        f"R {row['price']:,.0f}"
+                    )
+
+                    c2.metric(
+                        "Size",
+                        f"{row['sqm']:.0f} m²"
+                    )
+
+                    c3.metric(
+                        "Rate / m²",
+                        (
+                            f"R "
+                            f"{row['rate_sqm']:,.2f}"
+                        )
+                    )
+
+                    c4.metric(
+                        "Value Rank",
+                        (
+                            f"Top "
+                            f"{row['true_percentile']:.1f}% "
+                            f"(#{int(row['rank_num'])} "
+                            f"of {total_clean_count})"
+                        )
+                    )
+
+                    st.divider()
+
+            else:
+                st.info(
+                    "No listings fell within "
+                    "the Top 3% threshold."
+                )
+
+            # ---------------------------------------------
+            # CLEAN MARKET TABLE
+            # ---------------------------------------------
+            with st.expander(
+                "👁️ View All Valid "
+                "Morningside Properties "
+                "(Cleaned)"
+            ):
+
+                display_df = clean_df[
+                    [
+                        "rank_num",
+                        "true_percentile",
+                        "title",
+                        "price",
+                        "sqm",
+                        "rate_sqm",
+                        "url"
+                    ]
+                ].copy()
+
+                display_df = (
+                    display_df.rename(
+                        columns={
+                            "rank_num":
+                                "Rank",
+                            "true_percentile":
+                                "Percentile %",
+                            "title":
+                                "Property",
+                            "price":
+                                "Price",
+                            "sqm":
+                                "Size m²",
+                            "rate_sqm":
+                                "Rate / m²",
+                            "url":
+                                "URL"
+                        }
+                    )
+                )
+
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
         else:
-            st.info("No listings fell within the Top 3% threshold.")
+            st.warning(
+                "Listings exist, but none "
+                "fall inside the current "
+                "clean market range."
+            )
 
-        with st.expander("👁️ View All Valid Morningside Properties (Cleaned)"):
-            st.dataframe(clean_df[['rank_num', 'true_percentile', 'title', 'price', 'sqm', 'rate_sqm', 'url']], use_container_width=True)
+    else:
+        st.info(
+            "No Morningside listings are "
+            "currently stored in the database."
+        )
 
 else:
-    st.info("👋 Welcome! Click the **🚀 Run Scraper & Market Engine** button above to run the density analysis.")
-
-conn.close()
+    st.info(
+        "👋 Welcome! Click the "
+        "**🚀 Run Scraper & Market Engine** "
+        "button above to run the density analysis."
+    )
