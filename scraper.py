@@ -1,30 +1,43 @@
 import os
 import re
+import time
+import random
 import sqlite3
-import requests
+from datetime import datetime, timezone
+from html import escape
+from urllib.parse import urljoin, urlsplit, urlunsplit
+
 import numpy as np
+import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DB_NAME = "properties.db"
 
-# 🛠️ AREA PRESET CONFIGURATION
 PRESET_SEARCHES = [
     {
         "name": "Morningside",
-        "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258"
+        "url": "https://www.property24.com/apartments-for-sale/morningside/sandton/gauteng/4258",
     }
 ]
+
+PHYSICAL_MIN_RATE = 6500
+PHYSICAL_MAX_RATE = 80000
+DEAL_PERCENT = 5
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # =========================================================
-    # RAW LISTINGS TABLE
-    # =========================================================
-
-    c.execute("""
+    # Current scrape snapshot. This can safely be rebuilt if an old schema is found.
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS raw_listings (
             id TEXT PRIMARY KEY,
             area TEXT,
@@ -34,29 +47,15 @@ def init_db():
             rate_sqm REAL,
             url TEXT
         )
-    """)
-
-    # Check existing schema
+        """
+    )
     c.execute("PRAGMA table_info(raw_listings)")
-    raw_columns = [row[1] for row in c.fetchall()]
-
-    required_raw_columns = {
-        "id",
-        "area",
-        "title",
-        "price",
-        "sqm",
-        "rate_sqm",
-        "url"
-    }
-
-    # If old / incompatible schema exists, rebuild table
-    if not required_raw_columns.issubset(set(raw_columns)):
-        print("⚠️ Old raw_listings schema detected. Rebuilding table.")
-
+    raw_columns = {row[1] for row in c.fetchall()}
+    required_raw = {"id", "area", "title", "price", "sqm", "rate_sqm", "url"}
+    if not required_raw.issubset(raw_columns):
         c.execute("DROP TABLE IF EXISTS raw_listings")
-
-        c.execute("""
+        c.execute(
+            """
             CREATE TABLE raw_listings (
                 id TEXT PRIMARY KEY,
                 area TEXT,
@@ -66,778 +65,580 @@ def init_db():
                 rate_sqm REAL,
                 url TEXT
             )
-        """)
+            """
+        )
 
-    # =========================================================
-    # AREA STATS TABLE
-    # =========================================================
-
-    c.execute("""
+    # Current market statistics. Also safe to rebuild from the next scrape.
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS area_stats (
             area TEXT PRIMARY KEY,
             total_raw INTEGER,
             total_clean INTEGER,
+            reported_total INTEGER,
+            pages_scraped INTEGER,
             real_min REAL,
             real_max REAL,
-            top_3_percentile REAL
+            real_median REAL,
+            bottom_5_cutoff REAL,
+            last_scraped_at TEXT
         )
-    """)
-
-    # Check existing schema
+        """
+    )
     c.execute("PRAGMA table_info(area_stats)")
-    stats_columns = [row[1] for row in c.fetchall()]
-
-    required_stats_columns = {
+    stats_columns = {row[1] for row in c.fetchall()}
+    required_stats = {
         "area",
         "total_raw",
         "total_clean",
+        "reported_total",
+        "pages_scraped",
         "real_min",
         "real_max",
-        "top_3_percentile"
+        "real_median",
+        "bottom_5_cutoff",
+        "last_scraped_at",
     }
-
-    # If old / incompatible schema exists, rebuild table
-    if not required_stats_columns.issubset(set(stats_columns)):
-        print("⚠️ Old area_stats schema detected. Rebuilding table.")
-
+    if not required_stats.issubset(stats_columns):
         c.execute("DROP TABLE IF EXISTS area_stats")
-
-        c.execute("""
+        c.execute(
+            """
             CREATE TABLE area_stats (
                 area TEXT PRIMARY KEY,
                 total_raw INTEGER,
                 total_clean INTEGER,
+                reported_total INTEGER,
+                pages_scraped INTEGER,
                 real_min REAL,
                 real_max REAL,
-                top_3_percentile REAL
+                real_median REAL,
+                bottom_5_cutoff REAL,
+                last_scraped_at TEXT
             )
-        """)
+            """
+        )
+
+    # Permanent discovery history. Do NOT drop this table because it prevents Telegram duplicates.
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS listing_history (
+            id TEXT PRIMARY KEY,
+            area TEXT,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            first_seen_qualifies INTEGER DEFAULT 0,
+            alerted INTEGER DEFAULT 0
+        )
+        """
+    )
+    c.execute("PRAGMA table_info(listing_history)")
+    history_columns = {row[1] for row in c.fetchall()}
+    history_additions = {
+        "area": "TEXT",
+        "first_seen_at": "TEXT",
+        "last_seen_at": "TEXT",
+        "first_seen_qualifies": "INTEGER DEFAULT 0",
+        "alerted": "INTEGER DEFAULT 0",
+    }
+    for column, column_type in history_additions.items():
+        if column not in history_columns:
+            c.execute(f"ALTER TABLE listing_history ADD COLUMN {column} {column_type}")
 
     conn.commit()
     conn.close()
 
 
-def clean_area_data(rates):
-    """
-    2-Pass Density Isolation Engine:
+def build_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-ZA,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }
+    )
+    return session
 
-    1. Physical reality boundary filter
-       R6,500/m² to R80,000/m².
 
-    2. Density gap isolation
-       Filters isolated stray points on the low/high ends.
-    """
+def normalise_url(href):
+    if not href:
+        return None
+    full_url = urljoin("https://www.property24.com", href)
+    parts = urlsplit(full_url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
-    if not rates:
-        return [], 0, 0, 0
 
-    rates = sorted(rates)
+def extract_number(text):
+    if not text:
+        return None
+    match = re.search(r"([\d\s,.]+)", text)
+    if not match:
+        return None
+    cleaned = re.sub(r"[^\d.]", "", match.group(1).replace(",", ""))
+    try:
+        return float(cleaned) if cleaned else None
+    except ValueError:
+        return None
 
-    # If very few observations, do not run density-gap removal
-    if len(rates) < 5:
-        real_min = float(min(rates))
-        real_max = float(max(rates))
 
-        top_3_thresh = float(
-            np.percentile(rates, 3)
-        )
+def extract_reported_total(soup):
+    text = soup.get_text(" ", strip=True)
+    match = re.search(r"\b([\d][\d\s,]*)\s+results\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(1))
+    return int(digits) if digits else None
 
-        return (
-            rates,
-            real_min,
-            real_max,
-            top_3_thresh
-        )
 
-    # =========================================================
-    # PASS 1: PHYSICAL REALITY FILTER
-    # =========================================================
-
-    filtered = [
-        r for r in rates
-        if 6500 <= r <= 80000
+def find_listing_tiles(soup):
+    # Property24 currently exposes result cards as js_resultTile/p24_tileContainer.
+    selectors = [
+        ".js_listingResultsContainer .js_resultTile",
+        ".js_listingResultsContainer [data-listing-number]",
+        ".js_resultTile",
+        "[data-listing-number]",
     ]
 
-    # If physical filter removes everything,
-    # fall back to original dataset
-    if not filtered:
-        filtered = rates.copy()
+    unique = []
+    seen_objects = set()
+    for selector in selectors:
+        for tile in soup.select(selector):
+            marker = id(tile)
+            if marker not in seen_objects:
+                seen_objects.add(marker)
+                unique.append(tile)
 
-    if len(filtered) == 1:
-        return (
-            filtered,
-            float(filtered[0]),
-            float(filtered[0]),
-            float(filtered[0])
-        )
+    return unique
 
-    # =========================================================
-    # PASS 2: DENSITY GAP DETECTION
-    # =========================================================
 
-    diffs = np.diff(filtered)
+def extract_listing_url(tile):
+    candidates = []
+    for a in tile.find_all("a", href=True):
+        href = a.get("href", "")
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        full_url = normalise_url(href)
+        if not full_url:
+            continue
+        score = 0
+        if "property24.com" in full_url:
+            score += 1
+        if re.search(r"/\d+$", urlsplit(full_url).path):
+            score += 3
+        if "/for-sale/" in full_url or "/to-rent/" in full_url:
+            score += 2
+        candidates.append((score, full_url))
 
-    median_diff = (
-        float(np.median(diffs))
-        if len(diffs) > 0
-        else 1.0
-    )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
-    # Protect against median difference being zero
-    if median_diff <= 0:
-        positive_diffs = [
-            float(d)
-            for d in diffs
-            if d > 0
-        ]
 
-        median_diff = (
-            float(np.median(positive_diffs))
-            if positive_diffs
-            else 1.0
-        )
+def parse_listing_tile(tile, area):
+    url = extract_listing_url(tile)
 
-    # =========================================================
-    # LOW-END ISOLATION
-    # =========================================================
+    listing_id = str(tile.get("data-listing-number") or "").strip()
+    if not listing_id and url:
+        match = re.search(r"/(\d+)$", urlsplit(url).path)
+        if match:
+            listing_id = match.group(1)
+
+    if not listing_id:
+        return None
+
+    title = None
+    meta_title = tile.select_one('meta[itemprop="name"]')
+    if meta_title and meta_title.get("content"):
+        title = meta_title.get("content").strip()
+    if not title:
+        title_tag = tile.select_one(".p24_title") or tile.select_one(".p24_location")
+        if title_tag:
+            title = title_tag.get_text(" ", strip=True)
+    if not title:
+        title = "Property Listing"
+
+    price = None
+    price_tag = tile.select_one(".p24_price")
+    if price_tag:
+        price = extract_number(price_tag.get_text(" ", strip=True))
+
+    sqm = None
+
+    # Prefer an explicitly labelled floor size.
+    floor_tag = tile.find(attrs={"title": re.compile(r"^Floor Size$", re.IGNORECASE)})
+    if floor_tag:
+        sqm = extract_number(floor_tag.get_text(" ", strip=True))
+
+    # Property24 commonly exposes the size in p24_size on the result card.
+    if sqm is None:
+        for size_tag in tile.select(".p24_size"):
+            size_text = size_tag.get_text(" ", strip=True)
+            if re.search(r"m\s*[²2]|sqm", size_text, flags=re.IGNORECASE):
+                sqm = extract_number(size_text)
+                if sqm:
+                    break
+
+    # Final fallback: search only within the listing card text.
+    if sqm is None:
+        tile_text = tile.get_text(" ", strip=True)
+        size_match = re.search(r"([\d][\d\s,.]*)\s*m\s*[²2]\b", tile_text, flags=re.IGNORECASE)
+        if size_match:
+            sqm = extract_number(size_match.group(1))
+
+    rate_sqm = None
+    if price is not None and sqm is not None and sqm > 0:
+        rate_sqm = price / sqm
+
+    return {
+        "id": listing_id,
+        "area": area,
+        "title": title,
+        "price": price,
+        "sqm": sqm,
+        "rate_sqm": rate_sqm,
+        "url": url,
+    }
+
+
+def clean_area_items(items):
+    usable = [x for x in items if x["rate_sqm"] is not None and x["rate_sqm"] > 0]
+    if not usable:
+        return [], 0.0, 0.0, 0.0
+
+    # Pass 1: broad physical plausibility bounds.
+    physical = [x for x in usable if PHYSICAL_MIN_RATE <= x["rate_sqm"] <= PHYSICAL_MAX_RATE]
+    if not physical:
+        physical = usable
+
+    physical = sorted(physical, key=lambda x: x["rate_sqm"])
+    if len(physical) < 5:
+        rates = [x["rate_sqm"] for x in physical]
+        return physical, float(min(rates)), float(max(rates)), float(np.median(rates))
+
+    # Pass 2: isolate large gaps only at the extreme tails.
+    rates = [x["rate_sqm"] for x in physical]
+    diffs = np.diff(rates)
+    positive_diffs = [float(d) for d in diffs if d > 0]
+    median_diff = float(np.median(positive_diffs)) if positive_diffs else 1.0
 
     low_idx = 0
-
-    for i in range(min(5, len(diffs))):
-
-        gap_threshold = max(
-            1500,
-            median_diff * 4
-        )
-
-        if diffs[i] > gap_threshold:
+    low_limit = min(8, len(diffs))
+    for i in range(low_limit):
+        if diffs[i] > max(1500, median_diff * 4):
             low_idx = i + 1
 
-    # =========================================================
-    # HIGH-END ISOLATION
-    # =========================================================
-
-    high_idx = len(filtered)
-
-    for i in range(
-        len(diffs) - 1,
-        max(len(diffs) - 6, -1),
-        -1
-    ):
-
-        gap_threshold = max(
-            3000,
-            median_diff * 4
-        )
-
-        if diffs[i] > gap_threshold:
+    high_idx = len(physical)
+    high_start = len(diffs) - 1
+    high_stop = max(len(diffs) - 9, -1)
+    for i in range(high_start, high_stop, -1):
+        if diffs[i] > max(3000, median_diff * 4):
             high_idx = i + 1
             break
 
-    clean_rates = filtered[
-        low_idx:high_idx
-    ]
+    clean = physical[low_idx:high_idx]
+    if not clean:
+        clean = physical
 
-    if not clean_rates:
-        clean_rates = filtered
-
-    real_min = float(
-        min(clean_rates)
-    )
-
-    real_max = float(
-        max(clean_rates)
-    )
-
-    # =========================================================
-    # TOP 3% BARGAIN THRESHOLD
-    #
-    # Lower R/m² = better value.
-    # Therefore the 3rd percentile is correct.
-    # =========================================================
-
-    top_3_thresh = float(
-        np.percentile(
-            clean_rates,
-            3
-        )
-    )
-
+    clean_rates = [x["rate_sqm"] for x in clean]
     return (
-        clean_rates,
-        real_min,
-        real_max,
-        top_3_thresh
+        clean,
+        float(min(clean_rates)),
+        float(max(clean_rates)),
+        float(np.median(clean_rates)),
     )
 
 
-def send_telegram_alert(
-    title,
-    area,
-    price,
-    sqm,
-    rate_sqm,
-    true_percentile,
-    rank_num,
-    total_clean,
-    url
-):
-
-    token = os.getenv(
-        "TELEGRAM_TOKEN"
-    )
-
-    chat_id = os.getenv(
-        "TELEGRAM_CHAT_ID"
-    )
-
+def send_telegram_alert(item, area, median_rate, rank_num, total_clean, percentile):
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("⚠️ Missing Telegram credentials.")
-        return
+        print("⚠️ Telegram credentials are missing.")
+        return False
+
+    below_median = ((median_rate - item["rate_sqm"]) / median_rate * 100) if median_rate else 0.0
+    title = escape(str(item["title"]))
+    area_html = escape(str(area))
+    url = escape(str(item["url"] or ""), quote=True)
 
     message = (
-        f"🔥 *TOP 3% BARGAIN ALERT!*\n\n"
-        f"📍 *Title:* {title}\n"
-        f"🏷️ *Area:* {area}\n"
-        f"🏆 *Value Rank:* Top {true_percentile:.1f}% "
-        f"(#{rank_num} of {total_clean} in area)\n"
-        f"💰 *Price:* R {price:,.0f}\n"
-        f"📐 *Size:* {sqm:.0f} m²\n"
-        f"⚡ *Rate:* R {rate_sqm:,.2f} / m²\n\n"
-        f"🔗 [View Listing on Property24]({url})"
+        "🔥 <b>NEW LOWEST 5% PROPERTY</b>\n\n"
+        f"📍 <b>{title}</b>\n"
+        f"🏷️ {area_html}\n"
+        f"💰 Price: <b>R {item['price']:,.0f}</b>\n"
+        f"📐 Size: <b>{item['sqm']:,.0f} m²</b>\n"
+        f"⚡ Rate: <b>R {item['rate_sqm']:,.2f} / m²</b>\n"
+        f"📉 Below median: <b>{below_median:.1f}%</b>\n"
+        f"🏆 Percentile: <b>{percentile:.2f}%</b> (#{rank_num} of {total_clean})\n\n"
+        f"🔗 <a href=\"{url}\">View on Property24</a>"
     )
-
-    api_url = (
-        f"https://api.telegram.org/"
-        f"bot{token}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False
-    }
 
     try:
-        res = requests.post(
-            api_url,
-            json=payload,
-            timeout=10
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
         )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            print(f"❌ Telegram rejected alert for {item['id']}: {payload}")
+            return False
+        print(f"✅ Telegram alert sent once for listing {item['id']}")
+        return True
+    except Exception as exc:
+        print(f"❌ Telegram alert failed for listing {item['id']}: {exc}")
+        return False
 
-        res.raise_for_status()
 
-        print(
-            f"✅ Alert sent for: {title}"
-        )
+def scrape_all_pages(session, search_name, base_url):
+    clean_url = re.sub(r"/p\d+/?$", "", base_url.rstrip("/"))
+    listings_by_id = {}
+    reported_total = None
+    pages_scraped = 0
+    page = 1
 
-    except Exception as e:
-        print(
-            f"❌ Failed to send Telegram alert: {e}"
-        )
+    while True:
+        page_url = clean_url if page == 1 else f"{clean_url}/p{page}"
+        print(f"Scraping {search_name} page {page}: {page_url}")
+
+        response = session.get(page_url, timeout=25)
+        if response.status_code in (404, 410):
+            print(f"Reached the end at page {page} (HTTP {response.status_code}).")
+            break
+        if response.status_code != 200:
+            raise RuntimeError(f"Property24 returned HTTP {response.status_code} on page {page}.")
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        if page == 1:
+            reported_total = extract_reported_total(soup)
+            if reported_total is not None:
+                print(f"Property24 reports {reported_total:,} results.")
+
+        tiles = find_listing_tiles(soup)
+        if not tiles:
+            print(f"No listing cards found on page {page}; pagination complete.")
+            break
+
+        ids_before_page = set(listings_by_id.keys())
+        page_ids = set()
+        for tile in tiles:
+            item = parse_listing_tile(tile, search_name)
+            if not item:
+                continue
+            page_ids.add(item["id"])
+            listings_by_id[item["id"]] = item
+
+        if not page_ids:
+            print(f"No usable listing IDs found on page {page}; pagination complete.")
+            break
+
+        # Stop if Property24 repeats the previous/last result page.
+        new_ids = page_ids - ids_before_page
+        if page > 1 and not new_ids:
+            print(f"Page {page} repeated previously seen listings; pagination complete.")
+            break
+
+        pages_scraped += 1
+        print(f"Page {page}: {len(page_ids)} cards, {len(listings_by_id)} unique listings so far.")
+
+        if reported_total is not None and len(listings_by_id) >= reported_total:
+            print("Captured the full Property24 reported result count.")
+            break
+
+        page += 1
+        if page > 500:
+            raise RuntimeError("Pagination exceeded 500 pages; stopped as a safety guard.")
+
+        time.sleep(random.uniform(0.45, 0.85))
+
+    return list(listings_by_id.values()), reported_total, pages_scraped
 
 
 def run_scraper():
     init_db()
-
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    session = build_session()
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/115.0.0.0 "
-            "Safari/537.36"
-        )
-    }
+    summaries = []
 
     try:
-
         for search in PRESET_SEARCHES:
-
             search_name = search["name"]
             base_url = search["url"]
+            print(f"\n--- Full-market scrape: {search_name} ---")
 
-            print(
-                f"\n--- Scraping All Pages for Area: "
-                f"{search_name} ---"
-            )
-
-            clean_url = re.sub(
-                r"/p\d+/?$",
-                "",
-                base_url.rstrip("/")
-            )
-
-            page = 1
-            max_pages = 10
-
-            area_listings = []
-
-            # =================================================
-            # SCRAPE ALL PAGES
-            # =================================================
-
-            while page <= max_pages:
-
-                page_url = (
-                    clean_url
-                    if page == 1
-                    else f"{clean_url}/p{page}"
-                )
-
-                print(
-                    f"Scraping Page {page}..."
-                )
-
-                try:
-
-                    res = requests.get(
-                        page_url,
-                        headers=headers,
-                        timeout=15
-                    )
-
-                    if res.status_code != 200:
-                        print(
-                            f"Stopping pagination. "
-                            f"HTTP {res.status_code}."
-                        )
-                        break
-
-                    soup = BeautifulSoup(
-                        res.text,
-                        "html.parser"
-                    )
-
-                    tiles = soup.find_all(
-                        "div",
-                        class_=re.compile(
-                            r"p24_tile|js_resultTile"
-                        )
-                    )
-
-                    if not tiles:
-                        print(
-                            "No listing tiles found."
-                        )
-                        break
-
-                    for tile in tiles:
-
-                        # =====================================
-                        # LISTING URL
-                        # =====================================
-
-                        link_tag = tile.find(
-                            "a",
-                            href=True
-                        )
-
-                        if not link_tag:
-                            continue
-
-                        href = link_tag["href"]
-
-                        full_url = (
-                            href
-                            if href.startswith("http")
-                            else
-                            f"https://www.property24.com{href}"
-                        )
-
-                        # =====================================
-                        # LISTING ID
-                        # =====================================
-
-                        listing_id_match = re.search(
-                            r"/(\d+)(?:[/?#]|$)",
-                            href
-                        )
-
-                        listing_id = (
-                            listing_id_match.group(1)
-                            if listing_id_match
-                            else full_url
-                        )
-
-                        # =====================================
-                        # TITLE
-                        # =====================================
-
-                        title_tag = (
-                            tile.find(
-                                "span",
-                                class_="p24_title"
-                            )
-                            or
-                            tile.find(
-                                "div",
-                                class_="p24_title"
-                            )
-                        )
-
-                        title = (
-                            title_tag.get_text(
-                                " ",
-                                strip=True
-                            )
-                            if title_tag
-                            else "Property Listing"
-                        )
-
-                        # =====================================
-                        # PRICE
-                        # =====================================
-
-                        price_tag = (
-                            tile.find(
-                                "div",
-                                class_="p24_price"
-                            )
-                            or
-                            tile.find(
-                                "span",
-                                class_="p24_price"
-                            )
-                        )
-
-                        if not price_tag:
-                            continue
-
-                        price_digits = re.sub(
-                            r"[^\d]",
-                            "",
-                            price_tag.get_text()
-                        )
-
-                        if not price_digits:
-                            continue
-
-                        price = float(
-                            price_digits
-                        )
-
-                        # =====================================
-                        # SIZE
-                        # Prefer floor size for apartments
-                        # =====================================
-
-                        sqm = None
-
-                        sqm_tag = (
-                            tile.find(
-                                "span",
-                                title="Floor Size"
-                            )
-                            or
-                            tile.find(
-                                "span",
-                                class_="p24_size"
-                            )
-                            or
-                            tile.find(
-                                "span",
-                                title="Erf Size"
-                            )
-                        )
-
-                        if sqm_tag:
-
-                            sqm_digits = re.sub(
-                                r"[^\d.]",
-                                "",
-                                sqm_tag.get_text()
-                            )
-
-                            if sqm_digits:
-
-                                try:
-                                    sqm = float(
-                                        sqm_digits
-                                    )
-
-                                except ValueError:
-                                    sqm = None
-
-                        # Fallback search inside tile text
-                        if sqm is None:
-
-                            tile_text = tile.get_text(
-                                " ",
-                                strip=True
-                            )
-
-                            sqm_match = re.search(
-                                r"([\d,.]+)\s*m[²2]",
-                                tile_text,
-                                flags=re.IGNORECASE
-                            )
-
-                            if sqm_match:
-
-                                sqm_text = (
-                                    sqm_match
-                                    .group(1)
-                                    .replace(",", "")
-                                )
-
-                                try:
-                                    sqm = float(
-                                        sqm_text
-                                    )
-
-                                except ValueError:
-                                    sqm = None
-
-                        if not sqm or sqm <= 0:
-                            continue
-
-                        # =====================================
-                        # RATE / M²
-                        # =====================================
-
-                        rate_sqm = (
-                            price / sqm
-                        )
-
-                        area_listings.append(
-                            {
-                                "id": listing_id,
-                                "area": search_name,
-                                "title": title,
-                                "price": price,
-                                "sqm": sqm,
-                                "rate_sqm": rate_sqm,
-                                "url": full_url
-                            }
-                        )
-
-                    page += 1
-
-                except Exception as e:
-
-                    print(
-                        f"Error scraping "
-                        f"{page_url}: {e}"
-                    )
-
-                    break
-
-            if not area_listings:
-
-                print(
-                    f"No usable listings found "
-                    f"for {search_name}."
-                )
-
-                continue
-
-            # =================================================
-            # REMOVE DUPLICATES FROM CURRENT SCRAPE
-            # =================================================
-
-            unique_listings = {}
-
-            for item in area_listings:
-                unique_listings[
-                    item["id"]
-                ] = item
-
-            area_listings = list(
-                unique_listings.values()
-            )
-
-            # =================================================
-            # CLEAR OLD AREA LISTINGS
-            #
-            # Prevent old expired listings from remaining
-            # inside the current market dataset.
-            # =================================================
-
+            # History as it existed BEFORE this scrape. This defines genuinely new listings.
             c.execute(
+                "SELECT id, alerted, first_seen_qualifies FROM listing_history WHERE area = ?",
+                (search_name,),
+            )
+            existing_history = {
+                row[0]: {"alerted": int(row[1] or 0), "first_seen_qualifies": int(row[2] or 0)}
+                for row in c.fetchall()
+            }
+
+            all_items, reported_total, pages_scraped = scrape_all_pages(
+                session, search_name, base_url
+            )
+            if not all_items:
+                raise RuntimeError(f"No listings were captured for {search_name}.")
+
+            total_raw = len(all_items)
+            clean_items, real_min, real_max, real_median = clean_area_items(all_items)
+            clean_items.sort(key=lambda x: x["rate_sqm"])
+            total_clean = len(clean_items)
+
+            deal_count = max(1, int(np.ceil(total_clean * DEAL_PERCENT / 100))) if total_clean else 0
+            deal_items = clean_items[:deal_count]
+            deal_ids = {x["id"] for x in deal_items}
+            bottom_5_cutoff = deal_items[-1]["rate_sqm"] if deal_items else None
+
+            # Replace current snapshot, but NEVER delete permanent listing_history.
+            c.execute("DELETE FROM raw_listings WHERE area = ?", (search_name,))
+            c.executemany(
                 """
-                DELETE FROM raw_listings
-                WHERE area = ?
+                INSERT OR REPLACE INTO raw_listings
+                    (id, area, title, price, sqm, rate_sqm, url)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (search_name,)
-            )
-
-            # =================================================
-            # SAVE CURRENT RAW LISTINGS
-            # =================================================
-
-            for item in area_listings:
-
-                c.execute(
-                    """
-                    INSERT OR REPLACE INTO raw_listings
+                [
                     (
-                        id,
-                        area,
-                        title,
-                        price,
-                        sqm,
-                        rate_sqm,
-                        url
+                        x["id"],
+                        x["area"],
+                        x["title"],
+                        x["price"],
+                        x["sqm"],
+                        x["rate_sqm"],
+                        x["url"],
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        item["id"],
-                        item["area"],
-                        item["title"],
-                        item["price"],
-                        item["sqm"],
-                        item["rate_sqm"],
-                        item["url"]
+                    for x in all_items
+                ],
+            )
+
+            now = utc_now()
+            for item in all_items:
+                if item["id"] not in existing_history:
+                    c.execute(
+                        """
+                        INSERT OR IGNORE INTO listing_history
+                            (id, area, first_seen_at, last_seen_at, first_seen_qualifies, alerted)
+                        VALUES (?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            item["id"],
+                            search_name,
+                            now,
+                            now,
+                            1 if item["id"] in deal_ids else 0,
+                        ),
                     )
-                )
-
-            conn.commit()
-
-            # =================================================
-            # DENSITY ENGINE
-            # =================================================
-
-            rates = [
-                x["rate_sqm"]
-                for x in area_listings
-            ]
-
-            (
-                clean_rates,
-                real_min,
-                real_max,
-                top_3_thresh
-            ) = clean_area_data(
-                rates
-            )
-
-            # =================================================
-            # CLEAN LISTINGS
-            # =================================================
-
-            clean_area_items = [
-                x
-                for x in area_listings
-                if (
-                    real_min
-                    <= x["rate_sqm"]
-                    <= real_max
-                )
-            ]
-
-            clean_area_items.sort(
-                key=lambda x: x[
-                    "rate_sqm"
-                ]
-            )
-
-            total_clean = len(
-                clean_area_items
-            )
-
-            # =================================================
-            # SAVE AREA STATISTICS
-            # =================================================
+                else:
+                    c.execute(
+                        "UPDATE listing_history SET last_seen_at = ? WHERE id = ?",
+                        (now, item["id"]),
+                    )
 
             c.execute(
                 """
                 INSERT INTO area_stats
-                (
-                    area,
-                    total_raw,
-                    total_clean,
-                    real_min,
-                    real_max,
-                    top_3_percentile
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-
-                ON CONFLICT(area)
-                DO UPDATE SET
-
-                    total_raw =
-                        excluded.total_raw,
-
-                    total_clean =
-                        excluded.total_clean,
-
-                    real_min =
-                        excluded.real_min,
-
-                    real_max =
-                        excluded.real_max,
-
-                    top_3_percentile =
-                        excluded.top_3_percentile
+                    (area, total_raw, total_clean, reported_total, pages_scraped,
+                     real_min, real_max, real_median, bottom_5_cutoff, last_scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(area) DO UPDATE SET
+                    total_raw = excluded.total_raw,
+                    total_clean = excluded.total_clean,
+                    reported_total = excluded.reported_total,
+                    pages_scraped = excluded.pages_scraped,
+                    real_min = excluded.real_min,
+                    real_max = excluded.real_max,
+                    real_median = excluded.real_median,
+                    bottom_5_cutoff = excluded.bottom_5_cutoff,
+                    last_scraped_at = excluded.last_scraped_at
                 """,
                 (
                     search_name,
-                    len(area_listings),
+                    total_raw,
                     total_clean,
+                    reported_total,
+                    pages_scraped,
                     real_min,
                     real_max,
-                    top_3_thresh
-                )
+                    real_median,
+                    bottom_5_cutoff,
+                    now,
+                ),
             )
-
             conn.commit()
 
+            # Alert only properties that qualified when they were FIRST discovered.
+            # Failed Telegram sends are retried later, but successful sends are never duplicated.
+            candidates = []
+            for rank_num, item in enumerate(clean_items, start=1):
+                if item["id"] not in deal_ids:
+                    continue
+                if item["id"] not in existing_history:
+                    candidates.append((rank_num, item))
+                else:
+                    hist = existing_history[item["id"]]
+                    if hist["first_seen_qualifies"] == 1 and hist["alerted"] == 0:
+                        candidates.append((rank_num, item))
+
+            for rank_num, item in candidates:
+                percentile = rank_num / total_clean * 100 if total_clean else 100.0
+                if send_telegram_alert(
+                    item,
+                    search_name,
+                    real_median,
+                    rank_num,
+                    total_clean,
+                    percentile,
+                ):
+                    c.execute("UPDATE listing_history SET alerted = 1 WHERE id = ?", (item["id"],))
+                    conn.commit()
+
             print(
-                f"{search_name}: "
-                f"{len(area_listings)} raw | "
-                f"{total_clean} clean | "
-                f"R {real_min:,.2f} - "
-                f"R {real_max:,.2f}/m² | "
-                f"Top 3% ceiling "
-                f"R {top_3_thresh:,.2f}/m²"
+                f"{search_name}: {total_raw:,} total | {total_clean:,} valid | "
+                f"median R {real_median:,.2f}/m² | lowest {DEAL_PERCENT}% = {deal_count} listings"
             )
 
-            # =================================================
-            # SEND TELEGRAM ALERTS
-            # =================================================
-
-            for idx, item in enumerate(
-                clean_area_items
-            ):
-
-                rank_num = idx + 1
-
-                true_percentile = (
-                    (
-                        rank_num
-                        / total_clean
-                    )
-                    * 100
-                    if total_clean > 0
-                    else 100.0
-                )
-
-                if (
-                    item["rate_sqm"]
-                    <= top_3_thresh
-                ):
-
-                    send_telegram_alert(
-                        item["title"],
-                        search_name,
-                        item["price"],
-                        item["sqm"],
-                        item["rate_sqm"],
-                        true_percentile,
-                        rank_num,
-                        total_clean,
-                        item["url"]
-                    )
+            summaries.append(
+                {
+                    "area": search_name,
+                    "total_raw": total_raw,
+                    "total_clean": total_clean,
+                    "reported_total": reported_total,
+                    "pages_scraped": pages_scraped,
+                    "deal_count": deal_count,
+                }
+            )
 
     finally:
+        session.close()
         conn.close()
+
+    return summaries
 
 
 if __name__ == "__main__":
