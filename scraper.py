@@ -46,7 +46,6 @@ def init_db():
         )
     ''')
 
-    # Auto-migration check for legacy database schemas
     c.execute("PRAGMA table_info(raw_listings)")
     columns = [col[1] for col in c.fetchall()]
     if "suburb" not in columns:
@@ -75,6 +74,17 @@ def init_db():
             listing_id TEXT PRIMARY KEY
         )
     ''')
+    
+    # 🧠 NEW: Table to remember whose turn it is
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS scraper_state (
+            id INTEGER PRIMARY KEY,
+            last_index INTEGER
+        )
+    ''')
+    # Insert default starting point if it doesn't exist
+    c.execute("INSERT OR IGNORE INTO scraper_state (id, last_index) VALUES (1, -1)")
+
     conn.commit()
     conn.close()
 
@@ -83,7 +93,6 @@ def clean_area_data(rates):
         return rates, min(rates) if rates else 0, max(rates) if rates else 0, 0, 0
 
     rates = sorted(rates)
-    
     filtered = [r for r in rates if 6500 <= r <= 80000]
     if not filtered:
         filtered = rates
@@ -174,14 +183,21 @@ def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def run_scraper(max_pages=2):
-    """
-    max_pages=2 per suburb is optimal when sorting by Newest.
-    32 total requests across all 16 suburbs = 100% stealth and zero 503 blocks!
-    """
+def run_scraper(max_pages=1):
     init_db()
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+
+    # Determine whose turn it is
+    c.execute("SELECT last_index FROM scraper_state WHERE id = 1")
+    last_index = c.fetchone()[0]
+    next_index = (last_index + 1) % len(PRESET_SEARCHES)
+    
+    search = PRESET_SEARCHES[next_index]
+    suburb_name = search["name"]
+    base_url = search["url"].rstrip('/')
+    
+    print(f"\n--- 🕒 Hourly Scrape Target: {suburb_name} (Page 1 Only, Sorted by Newest) ---")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -189,112 +205,84 @@ def run_scraper(max_pages=2):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     }
 
-    for search in PRESET_SEARCHES:
-        suburb_name = search["name"]
-        base_url = search["url"].rstrip('/')
-        
-        print(f"\n--- Scraping {suburb_name} Apartments (Sorted by Newest) ---")
+    page = 1
+    listings = []
+    seen_ids = set()
 
-        page = 1
-        listings = []
-        seen_ids = set()
-
-        while page <= max_pages:
-            # Append Property24 sort parameter for 'Newest' listings
-            page_url = f"{base_url}/p{page}?sp=so%3dNewest"
-            print(f"Fetching page {page} for {suburb_name}...")
+    page_url = f"{base_url}/p{page}?sp=so%3dNewest"
+    
+    try:
+        res = requests.get(page_url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
             
-            try:
-                res = requests.get(page_url, headers=headers, timeout=10)
-                if res.status_code != 200:
-                    print(f"Reached end of pages or hit a wall (HTTP {res.status_code}). Stopping.")
-                    break
-
-                soup = BeautifulSoup(res.text, "html.parser")
-                tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
+            for tile in tiles:
+                link_tag = tile.find("a", href=True)
+                if not link_tag:
+                    continue
+                href = link_tag['href']
                 
-                if not tiles:
-                    print(f"No property tiles found on page {page}. Scraping complete for {suburb_name}.")
-                    break
+                clean_href = href.split('?')[0]
+                full_url = clean_href if clean_href.startswith("http") else f"https://www.property24.com{clean_href}"
+                
+                listing_id_match = re.search(r'/(\d+)$', clean_href)
+                listing_id = listing_id_match.group(1) if listing_id_match else clean_href
+                
+                if listing_id in seen_ids:
+                    continue
+                seen_ids.add(listing_id)
 
-                new_on_page = 0
+                title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
+                title = title_tag.text.strip() if title_tag else "Apartment"
 
-                for tile in tiles:
-                    link_tag = tile.find("a", href=True)
-                    if not link_tag:
-                        continue
-                    href = link_tag['href']
-                    
-                    # 🧼 CLEAN URL & EXTRACT PURE NUMERICAL LISTING ID
-                    clean_href = href.split('?')[0]
-                    full_url = clean_href if clean_href.startswith("http") else f"https://www.property24.com{clean_href}"
-                    
-                    listing_id_match = re.search(r'/(\d+)$', clean_href)
-                    listing_id = listing_id_match.group(1) if listing_id_match else clean_href
-                    
-                    if listing_id in seen_ids:
-                        continue
-                    seen_ids.add(listing_id)
-                    new_on_page += 1
+                price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
+                if not price_tag:
+                    continue
+                price_digits = re.sub(r'[^\d]', '', price_tag.text)
+                if not price_digits:
+                    continue
+                price = float(price_digits)
 
-                    title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
-                    title = title_tag.text.strip() if title_tag else "Apartment"
+                sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
+                sqm = None
+                if not sqm_tag:
+                    sqm_match = re.search(r'(\d+)\s*m²', tile.text)
+                    if sqm_match: sqm = float(sqm_match.group(1))
+                else:
+                    sqm_digits = re.sub(r'[^\d]', '', sqm_tag.text)
+                    if sqm_digits: sqm = float(sqm_digits)
 
-                    price_tag = tile.find("div", class_="p24_price") or tile.find("span", class_="p24_price")
-                    if not price_tag:
-                        continue
-                    price_digits = re.sub(r'[^\d]', '', price_tag.text)
-                    if not price_digits:
-                        continue
-                    price = float(price_digits)
+                if not sqm or sqm <= 0:
+                    continue
+                
+                bed_tag = tile.find("span", title="Bedrooms")
+                beds = float(re.sub(r'[^\d\.]', '', bed_tag.text)) if bed_tag and re.search(r'\d', bed_tag.text) else None
+                
+                bath_tag = tile.find("span", title="Bathrooms")
+                baths = float(re.sub(r'[^\d\.]', '', bath_tag.text)) if bath_tag and re.search(r'\d', bath_tag.text) else None
 
-                    sqm_tag = tile.find("span", title="Erf Size") or tile.find("span", title="Floor Size") or tile.find("span", class_="p24_size")
-                    sqm = None
-                    if not sqm_tag:
-                        sqm_match = re.search(r'(\d+)\s*m²', tile.text)
-                        if sqm_match: sqm = float(sqm_match.group(1))
-                    else:
-                        sqm_digits = re.sub(r'[^\d]', '', sqm_tag.text)
-                        if sqm_digits: sqm = float(sqm_digits)
+                rate_sqm = price / sqm
 
-                    if not sqm or sqm <= 0:
-                        continue
-                    
-                    bed_tag = tile.find("span", title="Bedrooms")
-                    beds = float(re.sub(r'[^\d\.]', '', bed_tag.text)) if bed_tag and re.search(r'\d', bed_tag.text) else None
-                    
-                    bath_tag = tile.find("span", title="Bathrooms")
-                    baths = float(re.sub(r'[^\d\.]', '', bath_tag.text)) if bath_tag and re.search(r'\d', bath_tag.text) else None
+                listings.append({
+                    "id": str(listing_id),
+                    "suburb": suburb_name,
+                    "title": title,
+                    "price": price,
+                    "sqm": sqm,
+                    "bedrooms": beds,
+                    "bathrooms": baths,
+                    "rate_sqm": rate_sqm,
+                    "url": full_url
+                })
+        else:
+            print(f"Reached end of pages or hit a wall (HTTP {res.status_code}).")
 
-                    rate_sqm = price / sqm
+    except Exception as e:
+        print(f"Error scraping {suburb_name} page {page}: {e}")
 
-                    listings.append({
-                        "id": str(listing_id),
-                        "suburb": suburb_name,
-                        "title": title,
-                        "price": price,
-                        "sqm": sqm,
-                        "bedrooms": beds,
-                        "bathrooms": baths,
-                        "rate_sqm": rate_sqm,
-                        "url": full_url
-                    })
-
-                if new_on_page == 0:
-                    print(f"Zero new properties found on page {page}. End of unique listings reached for {suburb_name}.")
-                    break
-
-                page += 1
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"Error scraping {suburb_name} page {page}: {e}")
-                break
-
-        if not listings:
-            print(f"No new valid listings scraped for {suburb_name}.")
-            continue
-
+    # Process and save the single suburb we scraped
+    if listings:
         raw_count = len(listings)
         print(f"Scraped {raw_count} total unique raw listings for {suburb_name}.")
 
@@ -308,55 +296,56 @@ def run_scraper(max_pages=2):
         c.execute("SELECT rate_sqm FROM raw_listings WHERE suburb=?", (suburb_name,))
         db_rates = [row[0] for row in c.fetchall()]
         
-        if not db_rates:
-            continue
+        if db_rates:
+            clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
 
-        clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
+            c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
+            all_db_items = []
+            for row in c.fetchall():
+                all_db_items.append({
+                    "id": row[0], "suburb": row[1], "title": row[2], "price": row[3], "sqm": row[4], 
+                    "bedrooms": row[5], "bathrooms": row[6], "rate_sqm": row[7], "url": row[8]
+                })
 
-        c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
-        all_db_items = []
-        for row in c.fetchall():
-            all_db_items.append({
-                "id": row[0], "suburb": row[1], "title": row[2], "price": row[3], "sqm": row[4], 
-                "bedrooms": row[5], "bathrooms": row[6], "rate_sqm": row[7], "url": row[8]
-            })
+            valid_items = [x for x in all_db_items if real_min <= x["rate_sqm"] <= real_max]
+            valid_items.sort(key=lambda x: x["rate_sqm"])
+            total_clean = len(valid_items)
 
-        valid_items = [x for x in all_db_items if real_min <= x["rate_sqm"] <= real_max]
-        valid_items.sort(key=lambda x: x["rate_sqm"])
-        total_clean = len(valid_items)
+            if total_clean > 0:
+                c.execute(
+                    "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (suburb_name, len(all_db_items), total_clean, real_min, real_max, median_rate, top_5_thresh)
+                )
+                conn.commit()
 
-        if total_clean == 0:
-            continue
+                top_5_count = int(np.ceil(total_clean * 0.05))
 
-        c.execute(
-            "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (suburb_name, len(all_db_items), total_clean, real_min, real_max, median_rate, top_5_thresh)
-        )
-        conn.commit()
+                for idx, item in enumerate(valid_items[:top_5_count]):
+                    rank_num = idx + 1
+                    true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
+                    pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
 
-        top_5_count = int(np.ceil(total_clean * 0.05))
+                    send_telegram_alert(
+                        listing_id=item["id"],
+                        suburb=item["suburb"],
+                        title=item["title"],
+                        price=item["price"],
+                        sqm=item["sqm"],
+                        beds=item["bedrooms"],
+                        baths=item["bathrooms"],
+                        rate_sqm=item["rate_sqm"],
+                        true_percentile=true_percentile,
+                        rank_num=rank_num,
+                        total_clean=total_clean,
+                        pct_below_median=pct_below_median,
+                        url=item["url"]
+                    )
+    else:
+        print(f"No new valid listings scraped for {suburb_name}.")
 
-        for idx, item in enumerate(valid_items[:top_5_count]):
-            rank_num = idx + 1
-            true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
-            pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
-
-            send_telegram_alert(
-                listing_id=item["id"],
-                suburb=item["suburb"],
-                title=item["title"],
-                price=item["price"],
-                sqm=item["sqm"],
-                beds=item["bedrooms"],
-                baths=item["bathrooms"],
-                rate_sqm=item["rate_sqm"],
-                true_percentile=true_percentile,
-                rank_num=rank_num,
-                total_clean=total_clean,
-                pct_below_median=pct_below_median,
-                url=item["url"]
-            )
-
+    # 🧠 Update state to point to the NEXT suburb for the next run
+    c.execute("UPDATE scraper_state SET last_index = ? WHERE id = 1", (next_index,))
+    conn.commit()
     conn.close()
 
 if __name__ == "__main__":
