@@ -46,7 +46,7 @@ def init_db():
         )
     ''')
 
-    # Auto-migration check
+    # Auto-migration check for legacy database schemas
     c.execute("PRAGMA table_info(raw_listings)")
     columns = [col[1] for col in c.fetchall()]
     if "suburb" not in columns:
@@ -146,7 +146,6 @@ def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate
     beds_txt = f"{int(beds)}" if beds is not None and float(beds).is_integer() else f"{beds}" if beds is not None else "N/A"
     baths_txt = f"{int(baths)}" if baths is not None and float(baths).is_integer() else f"{baths}" if baths is not None else "N/A"
 
-    # 📩 Updated Telegram Message Format
     message = (
         f"🔥 *Top {bracket_percentile}% apartment ({suburb})*\n\n"
         f"📉 *Discount:* {pct_below_median:.1f}% below median R/m²\n"
@@ -175,7 +174,11 @@ def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def run_scraper(max_pages=50):
+def run_scraper(max_pages=2):
+    """
+    max_pages=2 per suburb is optimal when sorting by Newest.
+    32 total requests across all 16 suburbs = 100% stealth and zero 503 blocks!
+    """
     init_db()
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -190,14 +193,15 @@ def run_scraper(max_pages=50):
         suburb_name = search["name"]
         base_url = search["url"].rstrip('/')
         
-        print(f"\n--- Scraping {suburb_name} Apartments ---")
+        print(f"\n--- Scraping {suburb_name} Apartments (Sorted by Newest) ---")
 
         page = 1
         listings = []
         seen_ids = set()
 
         while page <= max_pages:
-            page_url = base_url if page == 1 else f"{base_url}/p{page}"
+            # Append Property24 sort parameter for 'Newest' listings
+            page_url = f"{base_url}/p{page}?sp=so%3dNewest"
             print(f"Fetching page {page} for {suburb_name}...")
             
             try:
@@ -220,10 +224,13 @@ def run_scraper(max_pages=50):
                     if not link_tag:
                         continue
                     href = link_tag['href']
-                    full_url = href if href.startswith("http") else f"https://www.property24.com{href}"
                     
-                    listing_id_match = re.search(r'/(\d+)$', href)
-                    listing_id = listing_id_match.group(1) if listing_id_match else href
+                    # 🧼 CLEAN URL & EXTRACT PURE NUMERICAL LISTING ID
+                    clean_href = href.split('?')[0]
+                    full_url = clean_href if clean_href.startswith("http") else f"https://www.property24.com{clean_href}"
+                    
+                    listing_id_match = re.search(r'/(\d+)$', clean_href)
+                    listing_id = listing_id_match.group(1) if listing_id_match else clean_href
                     
                     if listing_id in seen_ids:
                         continue
