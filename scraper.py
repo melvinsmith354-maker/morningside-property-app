@@ -2,6 +2,7 @@ import os
 import re
 import time
 import sqlite3
+import sys
 import requests
 import numpy as np
 from bs4 import BeautifulSoup
@@ -75,14 +76,12 @@ def init_db():
         )
     ''')
     
-    # 🧠 NEW: Table to remember whose turn it is
     c.execute('''
         CREATE TABLE IF NOT EXISTS scraper_state (
             id INTEGER PRIMARY KEY,
             last_index INTEGER
         )
     ''')
-    # Insert default starting point if it doesn't exist
     c.execute("INSERT OR IGNORE INTO scraper_state (id, last_index) VALUES (1, -1)")
 
     conn.commit()
@@ -183,21 +182,11 @@ def send_telegram_alert(listing_id, suburb, title, price, sqm, beds, baths, rate
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
-def run_scraper(max_pages=1):
-    init_db()
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-
-    # Determine whose turn it is
-    c.execute("SELECT last_index FROM scraper_state WHERE id = 1")
-    last_index = c.fetchone()[0]
-    next_index = (last_index + 1) % len(PRESET_SEARCHES)
+def scrape_suburb(suburb_dict, max_pages=1):
+    suburb_name = suburb_dict["name"]
+    base_url = suburb_dict["url"].rstrip('/')
     
-    search = PRESET_SEARCHES[next_index]
-    suburb_name = search["name"]
-    base_url = search["url"].rstrip('/')
-    
-    print(f"\n--- 🕒 Hourly Scrape Target: {suburb_name} (Page 1 Only, Sorted by Newest) ---")
+    print(f"\n--- Scraping {suburb_name} (Max Pages: {max_pages}, Sorted by Newest) ---")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -205,18 +194,25 @@ def run_scraper(max_pages=1):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     }
 
-    page = 1
     listings = []
-    seen_ids = set()
+    scraped_this_run_ids = set()
 
-    page_url = f"{base_url}/p{page}?sp=so%3dNewest"
-    
-    try:
-        res = requests.get(page_url, headers=headers, timeout=10)
-        if res.status_code == 200:
+    for page in range(1, max_pages + 1):
+        page_url = f"{base_url}/p{page}?sp=so%3dNewest"
+        print(f"Fetching page {page} for {suburb_name}...")
+        
+        try:
+            res = requests.get(page_url, headers=headers, timeout=10)
+            if res.status_code != 200:
+                print(f"Reached end or hit block (HTTP {res.status_code}). Stopping.")
+                break
+
             soup = BeautifulSoup(res.text, "html.parser")
             tiles = soup.find_all("div", class_=re.compile("p24_tile|js_resultTile"))
-            
+            if not tiles:
+                break
+
+            new_on_page = 0
             for tile in tiles:
                 link_tag = tile.find("a", href=True)
                 if not link_tag:
@@ -229,9 +225,10 @@ def run_scraper(max_pages=1):
                 listing_id_match = re.search(r'/(\d+)$', clean_href)
                 listing_id = listing_id_match.group(1) if listing_id_match else clean_href
                 
-                if listing_id in seen_ids:
+                if listing_id in scraped_this_run_ids:
                     continue
-                seen_ids.add(listing_id)
+                scraped_this_run_ids.add(str(listing_id))
+                new_on_page += 1
 
                 title_tag = tile.find("span", class_="p24_title") or tile.find("div", class_="p24_title")
                 title = title_tag.text.strip() if title_tag else "Apartment"
@@ -275,17 +272,21 @@ def run_scraper(max_pages=1):
                     "rate_sqm": rate_sqm,
                     "url": full_url
                 })
-        else:
-            print(f"Reached end of pages or hit a wall (HTTP {res.status_code}).")
 
-    except Exception as e:
-        print(f"Error scraping {suburb_name} page {page}: {e}")
+            if new_on_page == 0:
+                break
+            time.sleep(1)
 
-    # Process and save the single suburb we scraped
+        except Exception as e:
+            print(f"Error scraping {suburb_name}: {e}")
+            break
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # 1. Store/Update newly scraped listings in historical database
     if listings:
-        raw_count = len(listings)
-        print(f"Scraped {raw_count} total unique raw listings for {suburb_name}.")
-
+        print(f"Scraped {len(listings)} unique listings for {suburb_name} during this run.")
         for item in listings:
             c.execute(
                 "INSERT OR REPLACE INTO raw_listings (id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -293,35 +294,40 @@ def run_scraper(max_pages=1):
             )
         conn.commit()
 
-        c.execute("SELECT rate_sqm FROM raw_listings WHERE suburb=?", (suburb_name,))
-        db_rates = [row[0] for row in c.fetchall()]
-        
-        if db_rates:
-            clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
+    # 2. Query ALL historical listings in database for this suburb
+    c.execute("SELECT rate_sqm FROM raw_listings WHERE suburb=?", (suburb_name,))
+    db_rates = [row[0] for row in c.fetchall()]
+    
+    if db_rates:
+        clean_rates, real_min, real_max, median_rate, top_5_thresh = clean_area_data(db_rates)
 
-            c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
-            all_db_items = []
-            for row in c.fetchall():
-                all_db_items.append({
-                    "id": row[0], "suburb": row[1], "title": row[2], "price": row[3], "sqm": row[4], 
-                    "bedrooms": row[5], "bathrooms": row[6], "rate_sqm": row[7], "url": row[8]
-                })
+        c.execute("SELECT id, suburb, title, price, sqm, bedrooms, bathrooms, rate_sqm, url FROM raw_listings WHERE suburb=?", (suburb_name,))
+        all_db_items = []
+        for row in c.fetchall():
+            all_db_items.append({
+                "id": row[0], "suburb": row[1], "title": row[2], "price": row[3], "sqm": row[4], 
+                "bedrooms": row[5], "bathrooms": row[6], "rate_sqm": row[7], "url": row[8]
+            })
 
-            valid_items = [x for x in all_db_items if real_min <= x["rate_sqm"] <= real_max]
-            valid_items.sort(key=lambda x: x["rate_sqm"])
-            total_clean = len(valid_items)
+        valid_items = [x for x in all_db_items if real_min <= x["rate_sqm"] <= real_max]
+        valid_items.sort(key=lambda x: x["rate_sqm"])
+        total_clean = len(valid_items)
 
-            if total_clean > 0:
-                c.execute(
-                    "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (suburb_name, len(all_db_items), total_clean, real_min, real_max, median_rate, top_5_thresh)
-                )
-                conn.commit()
+        if total_clean > 0:
+            c.execute(
+                "INSERT OR REPLACE INTO area_stats (suburb, total_raw, total_clean, real_min, real_max, median_rate, top_5_percentile) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (suburb_name, len(all_db_items), total_clean, real_min, real_max, median_rate, top_5_thresh)
+            )
+            conn.commit()
 
-                top_5_count = int(np.ceil(total_clean * 0.05))
+            top_5_count = int(np.ceil(total_clean * 0.05))
 
-                for idx, item in enumerate(valid_items[:top_5_count]):
-                    rank_num = idx + 1
+            # 3. ONLY alert if property was scraped IN THIS RUN AND is in Top 5% of historical DB
+            for idx, item in enumerate(valid_items[:top_5_count]):
+                rank_num = idx + 1
+                
+                # STRICT GATEKEEPER: Must be scraped in this run to trigger alert
+                if item["id"] in scraped_this_run_ids:
                     true_percentile = (rank_num / total_clean) * 100 if total_clean > 0 else 100.0
                     pct_below_median = ((median_rate - item["rate_sqm"]) / median_rate) * 100 if median_rate > 0 else 0.0
 
@@ -340,13 +346,40 @@ def run_scraper(max_pages=1):
                         pct_below_median=pct_below_median,
                         url=item["url"]
                     )
-    else:
-        print(f"No new valid listings scraped for {suburb_name}.")
 
-    # 🧠 Update state to point to the NEXT suburb for the next run
+    conn.close()
+
+def run_scraper(max_pages=1):
+    init_db()
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    # Determine whose turn it is in the hourly rotation
+    c.execute("SELECT last_index FROM scraper_state WHERE id = 1")
+    last_index = c.fetchone()[0]
+    next_index = (last_index + 1) % len(PRESET_SEARCHES)
+    
+    # Save state
     c.execute("UPDATE scraper_state SET last_index = ? WHERE id = 1", (next_index,))
     conn.commit()
     conn.close()
 
+    target_suburb = PRESET_SEARCHES[next_index]
+    scrape_suburb(target_suburb, max_pages=1)
+
+def seed_all_suburbs(max_pages=30):
+    """Run this locally once to build full historical dataset for all 16 suburbs!"""
+    init_db()
+    print(f"🚀 Starting ONE-TIME HISTORICAL SEED for all {len(PRESET_SEARCHES)} suburbs...")
+    for idx, suburb in enumerate(PRESET_SEARCHES):
+        print(f"\n--- Seeding [{idx+1}/{len(PRESET_SEARCHES)}]: {suburb['name']} ---")
+        scrape_suburb(suburb, max_pages=max_pages)
+        time.sleep(2)
+    print("\n✅ SEEDING COMPLETE! You can now commit properties.db to GitHub.")
+
 if __name__ == "__main__":
-    run_scraper()
+    # If run with 'seed' argument: python scraper.py seed
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "seed":
+        seed_all_suburbs(max_pages=25)
+    else:
+        run_scraper(max_pages=1)
