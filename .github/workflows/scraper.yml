@@ -2,7 +2,7 @@ name: Property24 Scraper Cron
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours (change if needed)
+    - cron: '0 * * * *'  # Runs at the top of every hour
   workflow_dispatch: # Allows you to trigger it manually from the Actions tab
 
 jobs:
